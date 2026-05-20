@@ -1,0 +1,8 @@
+# Credentials — never commit
+config.toml
+
+# Runtime data
+store/
+
+# Rust build artifacts
+target/

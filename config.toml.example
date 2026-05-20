@@ -1,0 +1,70 @@
+[calendar]
+# Add one [[calendar.sources]] block per calendar (see below).
+
+# Daily summary — posted every day at the configured time.
+# enabled defaults to true, so omitting this section keeps the daily reminder on.
+[calendar.daily]
+enabled = true
+time = "07:00"          # 24h HH:MM
+post_if_empty = false   # set true to post even when there are no events
+
+# Weekly overview — posted at the start of the configured weekday.
+[calendar.weekly]
+enabled = false
+day = "monday"          # monday, tuesday, wednesday, thursday, friday, saturday, sunday
+time = "07:00"
+post_if_empty = false
+
+# Monthly overview — posted on the configured day of each month.
+[calendar.monthly]
+enabled = false
+day = 1                 # day of month (1–31; clamped to last day for short months)
+time = "07:00"
+post_if_empty = false
+
+# Add one [[calendar.sources]] block per calendar.
+# Each source can use either ics_url (direct ICS file) or caldav_url (CalDAV REPORT).
+
+# --- Source 1: public ICS link (e.g. from Nextcloud: Calendar → ⋮ → Copy as ICS link) ---
+[[calendar.sources]]
+ics_url = "https://cloud.example.com/remote.php/dav/public-calendars/TOKEN"
+
+# --- Source 2: private CalDAV calendar with basic auth (app password recommended) ---
+[[calendar.sources]]
+caldav_url = "https://cloud.example.com/remote.php/dav/calendars/user/personal/"
+username = "youruser"
+password = "yourapppassword"
+
+# --- Source 3: all calendars from a CalDAV account (auto-discovery) ---
+# Fetches every calendar found under the account root. Use 'exclude' to skip unwanted ones.
+# [[calendar.sources]]
+# caldav_account_url = "https://cloud.example.com/remote.php/dav/calendars/user/"
+# username = "youruser"
+# password = "yourapppassword"
+# exclude = ["contact_birthdays", "holidays-in-germany"]  # optional
+
+# --- Source 4: another ICS calendar (e.g. public holiday feed) ---
+# [[calendar.sources]]
+# ics_url = "https://www.calendarlabs.com/ical-calendar/ics/example.ics"
+
+[matrix]
+homeserver = "https://matrix.org"
+user_id = "@yourbot:matrix.org"
+access_token = "syt_YOUR_ACCESS_TOKEN"
+device_id = "YOUR_DEVICE_ID"
+# Optional: security key from Element's "Set up Secure Backup"
+# recovery_key = "EsXX xxxx xxxx xxxx xxxx xxxx xxxx xxxx"
+
+[security]
+# Users allowed to invite the bot to Matrix rooms. Empty = accept from anyone.
+allowed_inviters = ["@you:matrix.org"]
+
+# Users allowed to run !reset-trust @user:server to let a user re-verify.
+# If empty (default), nobody can reset trust — the bot only trusts the first verification.
+admin_users = ["@you:matrix.org"]
+
+# Which devices receive room keys:
+#   identity_based  — only cross-signed devices (default, recommended)
+#   only_trusted    — only explicitly verified devices
+#   all_devices     — all devices, no restriction
+encryption_strategy = "identity_based"
