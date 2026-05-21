@@ -23,7 +23,7 @@ use matrix_sdk::{
         },
     },
 };
-use matrix_sdk_base::crypto::CollectStrategy;
+use matrix_sdk_crypto::CollectStrategy;
 use serde::Deserialize;
 use tokio::{fs, time::sleep, time::Duration as TokioDuration};
 use tracing::{error, info, warn};
