@@ -327,6 +327,7 @@ dependencies = [
  "futures-util",
  "matrix-sdk",
  "matrix-sdk-crypto",
+ "mxbot-common",
  "reqwest",
  "serde",
  "tokio",
@@ -2076,6 +2077,19 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mxbot-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "matrix-sdk",
+ "matrix-sdk-crypto",
+ "serde",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
