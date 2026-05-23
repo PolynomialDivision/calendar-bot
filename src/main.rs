@@ -22,7 +22,7 @@ use matrix_sdk::{
 };
 use mxbot_common::config::{MatrixConfig, SecurityConfig};
 use serde::Deserialize;
-use tokio::{fs, time::sleep, time::Duration as TokioDuration};
+use tokio::{time::sleep, time::Duration as TokioDuration};
 use tracing::{error, info, warn};
 
 // ── Config ────────────────────────────────────────────────────────────────────
