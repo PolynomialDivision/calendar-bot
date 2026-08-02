@@ -1,26 +1,22 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 use matrix_sdk::{
-    Client, Room, RoomState,
     config::SyncSettings,
     ruma::{
-        OwnedServerName, OwnedUserId, RoomOrAliasId,
         api::client::filter::FilterDefinition,
-        events::{
-            key::verification::request::ToDeviceKeyVerificationRequestEvent,
-            room::{
-                member::StrippedRoomMemberEvent,
-                message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
-            },
+        events::room::{
+            member::StrippedRoomMemberEvent,
+            message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
         },
+        OwnedServerName, OwnedUserId, RoomOrAliasId,
     },
+    Client, Room, RoomState,
 };
 use mxbot_common::config::{MatrixConfig, SecurityConfig};
+use mxbot_common::verify::VerificationService;
 use serde::Deserialize;
 use tokio::{time::sleep, time::Duration as TokioDuration};
 use tracing::{error, info, warn};
@@ -52,19 +48,25 @@ struct CalendarSource {
     exclude: Vec<String>,
 }
 
-fn default_true() -> bool { true }
-fn default_weekly_day() -> String { "monday".to_owned() }
-fn default_monthly_day() -> u32 { 1 }
+fn default_true() -> bool {
+    true
+}
+fn default_weekly_day() -> String {
+    "monday".to_owned()
+}
+fn default_monthly_day() -> u32 {
+    1
+}
 
 fn parse_weekday(s: &str) -> Weekday {
     match s.to_lowercase().as_str() {
-        "tuesday"   | "tue" => Weekday::Tue,
+        "tuesday" | "tue" => Weekday::Tue,
         "wednesday" | "wed" => Weekday::Wed,
-        "thursday"  | "thu" => Weekday::Thu,
-        "friday"    | "fri" => Weekday::Fri,
-        "saturday"  | "sat" => Weekday::Sat,
-        "sunday"    | "sun" => Weekday::Sun,
-        _                   => Weekday::Mon,
+        "thursday" | "thu" => Weekday::Thu,
+        "friday" | "fri" => Weekday::Fri,
+        "saturday" | "sat" => Weekday::Sat,
+        "sunday" | "sun" => Weekday::Sun,
+        _ => Weekday::Mon,
     }
 }
 
@@ -140,7 +142,7 @@ struct BotState {
     bot_user_id: OwnedUserId,
     allowed_inviters: HashSet<OwnedUserId>,
     admin_users: HashSet<OwnedUserId>,
-    reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
+    verification: VerificationService,
 }
 
 // ── ICS parsing ───────────────────────────────────────────────────────────────
@@ -197,7 +199,9 @@ fn parse_ics(ics: &str) -> Vec<IcsEvent> {
         let Some(ref mut ev) = current else { continue };
 
         // Split "KEY;PARAMS:VALUE" — the first colon separates key+params from value.
-        let Some(colon) = line.find(':') else { continue };
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
         let key_part = &line[..colon];
         let value = &line[colon + 1..];
 
@@ -431,7 +435,10 @@ async fn fetch_ics_caldav(
     start: NaiveDate,
     end: NaiveDate,
 ) -> Result<Vec<String>> {
-    let url = src.caldav_url.as_deref().context("No caldav_url configured")?;
+    let url = src
+        .caldav_url
+        .as_deref()
+        .context("No caldav_url configured")?;
     let start = start.format("%Y%m%dT000000Z").to_string();
     let end = end.format("%Y%m%dT000000Z").to_string();
 
@@ -477,11 +484,11 @@ async fn fetch_ics_caldav(
 }
 
 /// PROPFIND the account root and return all calendar collection URLs found.
-async fn discover_calendars(
-    http: &reqwest::Client,
-    src: &CalendarSource,
-) -> Result<Vec<String>> {
-    let account_url = src.caldav_account_url.as_deref().context("No caldav_account_url")?;
+async fn discover_calendars(http: &reqwest::Client, src: &CalendarSource) -> Result<Vec<String>> {
+    let account_url = src
+        .caldav_account_url
+        .as_deref()
+        .context("No caldav_account_url")?;
 
     let body = r#"<?xml version="1.0" encoding="UTF-8"?>
 <D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -506,9 +513,16 @@ async fn discover_calendars(
     // We split by <D:response> blocks and keep those that declare a calendar collection.
     let mut urls = Vec::new();
     let mut pos = 0;
-    while let Some(rel) = xml[pos..].find("<D:response>").or_else(|| xml[pos..].find("<d:response>")) {
+    while let Some(rel) = xml[pos..]
+        .find("<D:response>")
+        .or_else(|| xml[pos..].find("<d:response>"))
+    {
         let block_start = pos + rel;
-        let close_tag = if xml[block_start..].starts_with("<D:") { "</D:response>" } else { "</d:response>" };
+        let close_tag = if xml[block_start..].starts_with("<D:") {
+            "</D:response>"
+        } else {
+            "</d:response>"
+        };
         let block_end = xml[block_start..]
             .find(close_tag)
             .map(|i| block_start + i + close_tag.len())
@@ -525,7 +539,8 @@ async fn discover_calendars(
 
         // Extract the href from this response block.
         let href = block
-            .find("<D:href>").or_else(|| block.find("<d:href>"))
+            .find("<D:href>")
+            .or_else(|| block.find("<d:href>"))
             .and_then(|s| {
                 let after = &block[s..];
                 let val_start = after.find('>').map(|i| i + 1)?;
@@ -575,7 +590,10 @@ async fn fetch_source_ics_events(
 ) -> Result<Vec<IcsEvent>> {
     if src.caldav_account_url.is_some() {
         let calendar_urls = discover_calendars(http, src).await?;
-        info!("Discovered {} calendar(s) from account", calendar_urls.len());
+        info!(
+            "Discovered {} calendar(s) from account",
+            calendar_urls.len()
+        );
         let mut all: Vec<IcsEvent> = Vec::new();
         for url in &calendar_urls {
             let cal_src = CalendarSource {
@@ -666,12 +684,23 @@ fn format_today_message(today: NaiveDate, events: &[DayEvent]) -> (String, Strin
             EventTime::AllDay => "All day".to_owned(),
             EventTime::At(dt) => dt.format("%H:%M").to_string(),
         };
-        let loc_plain = ev.location.as_deref().map(|l| format!(" [{l}]")).unwrap_or_default();
-        let loc_html = ev.location.as_deref()
+        let loc_plain = ev
+            .location
+            .as_deref()
+            .map(|l| format!(" [{l}]"))
+            .unwrap_or_default();
+        let loc_html = ev
+            .location
+            .as_deref()
             .map(|l| format!(" <em>[{}]</em>", html_escape(l)))
             .unwrap_or_default();
         plain_lines.push(format!("• {} {}{}", time_str, ev.summary, loc_plain));
-        html_lines.push(format!("• {} {}{}", time_str, html_escape(&ev.summary), loc_html));
+        html_lines.push(format!(
+            "• {} {}{}",
+            time_str,
+            html_escape(&ev.summary),
+            loc_html
+        ));
     }
 
     (plain_lines.join("\n"), html_lines.join("<br>"))
@@ -707,14 +736,25 @@ fn format_week_message(
                 EventTime::AllDay => "All day".to_owned(),
                 EventTime::At(dt) => dt.format("%H:%M").to_string(),
             };
-            let loc_plain = ev.location.as_deref().map(|l| format!(" [{l}]")).unwrap_or_default();
-            let loc_html = ev.location.as_deref()
+            let loc_plain = ev
+                .location
+                .as_deref()
+                .map(|l| format!(" [{l}]"))
+                .unwrap_or_default();
+            let loc_html = ev
+                .location
+                .as_deref()
                 .map(|l| format!(" <em>[{}]</em>", html_escape(l)))
                 .unwrap_or_default();
-            plain_lines.push(format!("{day_prefix} · {} {}{}", time_str, ev.summary, loc_plain));
+            plain_lines.push(format!(
+                "{day_prefix} · {} {}{}",
+                time_str, ev.summary, loc_plain
+            ));
             html_lines.push(format!(
                 "<strong>{day_prefix}</strong> · {} {}{}",
-                time_str, html_escape(&ev.summary), loc_html,
+                time_str,
+                html_escape(&ev.summary),
+                loc_html,
             ));
         }
     }
@@ -738,7 +778,12 @@ fn parse_hm(s: &str) -> (u32, u32) {
     (h, m)
 }
 
-async fn check_and_post(_state: &BotState, client: &Client, http: &reqwest::Client, config: &CalendarConfig) {
+async fn check_and_post(
+    _state: &BotState,
+    client: &Client,
+    http: &reqwest::Client,
+    config: &CalendarConfig,
+) {
     let today = Local::now().date_naive();
     let events = get_todays_events(http, config, today).await;
 
@@ -748,10 +793,16 @@ async fn check_and_post(_state: &BotState, client: &Client, http: &reqwest::Clie
     }
 
     let (plain, html) = format_today_message(today, &events);
-    info!("Posting daily summary ({} event(s)) to Matrix", events.len());
+    info!(
+        "Posting daily summary ({} event(s)) to Matrix",
+        events.len()
+    );
 
     for room in client.joined_rooms() {
-        if let Err(e) = room.send(RoomMessageEventContent::text_html(&plain, &html)).await {
+        if let Err(e) = room
+            .send(RoomMessageEventContent::text_html(&plain, &html))
+            .await
+        {
             error!("Failed to send daily summary to {}: {e}", room.room_id());
         }
     }
@@ -920,14 +971,25 @@ fn format_month_message(
                 EventTime::AllDay => "All day".to_owned(),
                 EventTime::At(dt) => dt.format("%H:%M").to_string(),
             };
-            let loc_plain = ev.location.as_deref().map(|l| format!(" [{l}]")).unwrap_or_default();
-            let loc_html = ev.location.as_deref()
+            let loc_plain = ev
+                .location
+                .as_deref()
+                .map(|l| format!(" [{l}]"))
+                .unwrap_or_default();
+            let loc_html = ev
+                .location
+                .as_deref()
                 .map(|l| format!(" <em>[{}]</em>", html_escape(l)))
                 .unwrap_or_default();
-            plain_lines.push(format!("{day_prefix} · {} {}{}", time_str, ev.summary, loc_plain));
+            plain_lines.push(format!(
+                "{day_prefix} · {} {}{}",
+                time_str, ev.summary, loc_plain
+            ));
             html_lines.push(format!(
                 "<strong>{day_prefix}</strong> · {} {}{}",
-                time_str, html_escape(&ev.summary), loc_html,
+                time_str,
+                html_escape(&ev.summary),
+                loc_html,
             ));
         }
     }
@@ -954,7 +1016,10 @@ async fn check_and_post_monthly(
     info!("Posting monthly summary ({total} event(s)) to Matrix");
 
     for room in client.joined_rooms() {
-        if let Err(e) = room.send(RoomMessageEventContent::text_html(&plain, &html)).await {
+        if let Err(e) = room
+            .send(RoomMessageEventContent::text_html(&plain, &html))
+            .await
+        {
             error!("Failed to send monthly summary to {}: {e}", room.room_id());
         }
     }
@@ -1031,14 +1096,14 @@ async fn main() -> Result<()> {
         anyhow::bail!("Config [calendar]: add at least one [[calendar.sources]] entry");
     }
 
-    let store_path = PathBuf::from(
-        std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()),
-    );
+    let store_path =
+        PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
     let (client, user_id) = mxbot_common::session::build_and_restore(
         &config.matrix,
         &store_path,
         config.security.encryption_strategy.into(),
-    ).await?;
+    )
+    .await?;
 
     let allowed_inviters: HashSet<OwnedUserId> = config
         .security
@@ -1060,6 +1125,13 @@ async fn main() -> Result<()> {
         .filter_map(|s| s.parse().ok())
         .collect();
 
+    let verification = VerificationService::allowlisted_tofu_from_config(
+        client.clone(),
+        &config.security.verification,
+        &config.security.allowed_inviters,
+    );
+    verification.install_handlers();
+
     if admin_users.is_empty() {
         warn!("No admin_users configured — !reset-trust command is disabled");
     } else {
@@ -1070,7 +1142,7 @@ async fn main() -> Result<()> {
         bot_user_id: user_id,
         allowed_inviters,
         admin_users,
-        reset_allowed: Arc::new(Mutex::new(HashSet::new())),
+        verification,
     };
 
     // Invite handler
@@ -1131,63 +1203,25 @@ async fn main() -> Result<()> {
         }
     });
 
-    // To-device verification
+    // In-room messages: verification requests are handled by mxbot-common.
     client.add_event_handler({
         let state = bot_state.clone();
-        move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
-            let state = state.clone();
-            async move {
-                let Some(request) = client
-                    .encryption()
-                    .get_verification_request(&ev.sender, &ev.content.transaction_id)
-                    .await
-                else {
-                    warn!("Verification request object not found");
-                    return;
-                };
-                tokio::spawn(mxbot_common::verify::handle_verification_request(
-                    client, Arc::clone(&state.reset_allowed), request,
-                ));
-            }
-        }
-    });
-
-    // In-room messages: verification requests and !reset-trust command
-    client.add_event_handler({
-        let state = bot_state.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
+        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
             let state = state.clone();
             async move {
                 if ev.sender == state.bot_user_id || room.state() != RoomState::Joined {
                     return;
                 }
                 if let MessageType::VerificationRequest(_) = &ev.content.msgtype {
-                    let Some(request) = client
-                        .encryption()
-                        .get_verification_request(&ev.sender, &ev.event_id)
-                        .await
-                    else {
-                        return;
-                    };
-                    tokio::spawn(mxbot_common::verify::handle_verification_request(
-                    client, Arc::clone(&state.reset_allowed), request,
-                ));
                     return;
                 }
-                let MessageType::Text(ref text) = ev.content.msgtype else { return };
-                if let Some(target) = text.body.trim().strip_prefix("!reset-trust ") {
-                    if state.admin_users.contains(&ev.sender) {
-                        match target.trim().parse::<OwnedUserId>() {
-                            Ok(target_user) => {
-                                state.reset_allowed.lock().await.insert(target_user.clone());
-                                info!("Trust reset allowed for {} (by {})", target_user, ev.sender);
-                            }
-                            Err(_) => warn!("!reset-trust: invalid user ID '{}'", target.trim()),
-                        }
-                    } else {
-                        warn!("!reset-trust from non-admin {} — ignored", ev.sender);
-                    }
-                }
+                let MessageType::Text(ref text) = ev.content.msgtype else {
+                    return;
+                };
+                state
+                    .verification
+                    .handle_admin_command(&ev.sender, &state.admin_users, text.body.trim())
+                    .await;
             }
         }
     });
@@ -1233,7 +1267,10 @@ async fn main() -> Result<()> {
     // Drain pending invites from prior sessions.
     let invited = client.invited_rooms();
     if !invited.is_empty() {
-        info!("Pending invite(s) found after initial sync — joining {} room(s)", invited.len());
+        info!(
+            "Pending invite(s) found after initial sync — joining {} room(s)",
+            invited.len()
+        );
         for room in invited {
             let room_id = room.room_id().to_owned();
             let via: Vec<OwnedServerName> = room_id
@@ -1253,7 +1290,10 @@ async fn main() -> Result<()> {
     }
 
     loop {
-        match client.sync(SyncSettings::default().filter(filter.clone().into())).await {
+        match client
+            .sync(SyncSettings::default().filter(filter.clone().into()))
+            .await
+        {
             Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
             Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
         }
