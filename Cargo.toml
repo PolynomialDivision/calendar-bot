@@ -8,8 +8,8 @@ name = "calendar-bot"
 path = "src/main.rs"
 
 [dependencies]
-matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
-matrix-sdk-crypto = "0.18"
+matrix-sdk = { version = "0.19.1", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
+matrix-sdk-crypto = "0.19.1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
