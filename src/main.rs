@@ -1,24 +1,17 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
-use matrix_sdk::{
-    config::SyncSettings,
-    ruma::{
-        api::client::filter::FilterDefinition,
-        events::room::{
-            member::StrippedRoomMemberEvent,
-            message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
-        },
-        OwnedServerName, OwnedUserId, RoomOrAliasId,
+use mxbot_common::{
+    config::{MatrixConfig, SecurityConfig, TimeOfDay},
+    matrix_sdk::{
+        deserialized_responses::EncryptionInfo,
+        ruma::events::room::message::{OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+        Room, RoomState,
     },
-    Client, Room, RoomState,
+    settings::Settings,
+    Bot,
 };
-use mxbot_common::config::{MatrixConfig, SecurityConfig};
-use mxbot_common::verify::VerificationService;
-use serde::Deserialize;
-use tokio::{time::sleep, time::Duration as TokioDuration};
+use serde::{Deserialize, Serialize};
+use tokio::{sync::watch, time::sleep, time::Duration as TokioDuration};
 use tracing::{error, info, warn};
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -83,17 +76,27 @@ fn month_day(year: i32, month: u32, day: u32) -> NaiveDate {
     })
 }
 
-#[derive(Deserialize, Default, Clone)]
+#[derive(Deserialize, Clone)]
 struct DailySummaryConfig {
     #[serde(default = "default_true")]
     enabled: bool,
     #[serde(default = "default_reminder_time")]
-    time: String,
+    time: TimeOfDay,
     #[serde(default)]
     post_if_empty: bool,
 }
 
-#[derive(Deserialize, Default, Clone)]
+impl Default for DailySummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            time: default_reminder_time(),
+            post_if_empty: false,
+        }
+    }
+}
+
+#[derive(Deserialize, Clone)]
 struct WeeklySummaryConfig {
     #[serde(default)]
     enabled: bool,
@@ -101,12 +104,23 @@ struct WeeklySummaryConfig {
     #[serde(default = "default_weekly_day")]
     day: String,
     #[serde(default = "default_reminder_time")]
-    time: String,
+    time: TimeOfDay,
     #[serde(default)]
     post_if_empty: bool,
 }
 
-#[derive(Deserialize, Default, Clone)]
+impl Default for WeeklySummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            day: default_weekly_day(),
+            time: default_reminder_time(),
+            post_if_empty: false,
+        }
+    }
+}
+
+#[derive(Deserialize, Clone)]
 struct MonthlySummaryConfig {
     #[serde(default)]
     enabled: bool,
@@ -114,9 +128,20 @@ struct MonthlySummaryConfig {
     #[serde(default = "default_monthly_day")]
     day: u32,
     #[serde(default = "default_reminder_time")]
-    time: String,
+    time: TimeOfDay,
     #[serde(default)]
     post_if_empty: bool,
+}
+
+impl Default for MonthlySummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            day: default_monthly_day(),
+            time: default_reminder_time(),
+            post_if_empty: false,
+        }
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -131,18 +156,76 @@ struct CalendarConfig {
     monthly: MonthlySummaryConfig,
 }
 
-fn default_reminder_time() -> String {
-    "07:00".to_owned()
+fn default_reminder_time() -> TimeOfDay {
+    TimeOfDay::new(7, 0)
+}
+
+// ── Runtime settings ──────────────────────────────────────────────────────────
+
+/// Summary schedule, adjustable by admins (`!admin set`) and persisted in
+/// `store/settings.json`. The `[calendar.*]` config tables are the defaults.
+#[derive(Serialize, Deserialize, Clone)]
+struct Schedule {
+    daily_enabled: bool,
+    daily_time: TimeOfDay,
+    daily_post_if_empty: bool,
+    weekly_enabled: bool,
+    weekly_day: String,
+    weekly_time: TimeOfDay,
+    weekly_post_if_empty: bool,
+    monthly_enabled: bool,
+    monthly_day: u32,
+    monthly_time: TimeOfDay,
+    monthly_post_if_empty: bool,
+}
+
+impl Schedule {
+    fn from_config(config: &CalendarConfig) -> Self {
+        Self {
+            daily_enabled: config.daily.enabled,
+            daily_time: config.daily.time,
+            daily_post_if_empty: config.daily.post_if_empty,
+            weekly_enabled: config.weekly.enabled,
+            weekly_day: config.weekly.day.clone(),
+            weekly_time: config.weekly.time,
+            weekly_post_if_empty: config.weekly.post_if_empty,
+            monthly_enabled: config.monthly.enabled,
+            monthly_day: config.monthly.day,
+            monthly_time: config.monthly.time,
+            monthly_post_if_empty: config.monthly.post_if_empty,
+        }
+    }
 }
 
 // ── Bot state ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct BotState {
-    bot_user_id: OwnedUserId,
-    allowed_inviters: HashSet<OwnedUserId>,
-    admin_users: HashSet<OwnedUserId>,
-    verification: VerificationService,
+    bot: Bot,
+    http: reqwest::Client,
+    config: CalendarConfig,
+    schedule: Settings<Schedule>,
+}
+
+impl BotState {
+    async fn broadcast(&self, what: &str, plain: &str, html: &str) {
+        for room in self.bot.broadcast_rooms() {
+            if let Err(e) = room
+                .send(RoomMessageEventContent::text_html(plain, html))
+                .await
+            {
+                error!("Failed to send {what} to {}: {e}", room.room_id());
+            }
+        }
+    }
+}
+
+/// Sleep until `target`, or until the schedule settings change (`false`).
+async fn sleep_until_or_changed(secs: u64, changes: &mut watch::Receiver<u64>) -> bool {
+    tokio::select! {
+        _ = sleep(TokioDuration::from_secs(secs)) => true,
+        _ = changes.changed() => false,
+    }
 }
 
 // ── ICS parsing ───────────────────────────────────────────────────────────────
@@ -771,23 +854,11 @@ fn html_escape(s: &str) -> String {
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
 
-fn parse_hm(s: &str) -> (u32, u32) {
-    let mut parts = s.splitn(2, ':');
-    let h = parts.next().and_then(|s| s.parse().ok()).unwrap_or(7);
-    let m = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    (h, m)
-}
-
-async fn check_and_post(
-    _state: &BotState,
-    client: &Client,
-    http: &reqwest::Client,
-    config: &CalendarConfig,
-) {
+async fn check_and_post(state: &BotState, post_if_empty: bool) {
     let today = Local::now().date_naive();
-    let events = get_todays_events(http, config, today).await;
+    let events = get_todays_events(&state.http, &state.config, today).await;
 
-    if events.is_empty() && !config.daily.post_if_empty {
+    if events.is_empty() && !post_if_empty {
         info!("No events today — staying silent");
         return;
     }
@@ -797,34 +868,34 @@ async fn check_and_post(
         "Posting daily summary ({} event(s)) to Matrix",
         events.len()
     );
-
-    for room in client.joined_rooms() {
-        if let Err(e) = room
-            .send(RoomMessageEventContent::text_html(&plain, &html))
-            .await
-        {
-            error!("Failed to send daily summary to {}: {e}", room.room_id());
-        }
-    }
+    state.broadcast("daily summary", &plain, &html).await;
 }
 
-async fn daily_scheduler_loop(
-    state: BotState,
-    client: Client,
-    http: reqwest::Client,
-    config: CalendarConfig,
-    test_mode: bool,
-) {
+fn naive_time(t: TimeOfDay) -> NaiveTime {
+    NaiveTime::from_hms_opt(t.hour, t.minute, 0).expect("TimeOfDay is validated")
+}
+
+async fn daily_scheduler_loop(state: BotState, test_mode: bool) {
     if test_mode {
-        info!("Test mode: posting daily summary immediately");
-        check_and_post(&state, &client, &http, &config).await;
+        let schedule = state.schedule.get();
+        if schedule.daily_enabled {
+            info!("Test mode: posting daily summary immediately");
+            check_and_post(&state, schedule.daily_post_if_empty).await;
+        }
         return;
     }
 
-    let (hour, minute) = parse_hm(&config.daily.time);
-    let target = NaiveTime::from_hms_opt(hour, minute, 0).expect("invalid daily time");
-
+    let mut changes = state.schedule.store().subscribe();
     loop {
+        let schedule = state.schedule.get();
+        if !schedule.daily_enabled {
+            info!("Daily summary disabled");
+            if changes.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let target = naive_time(schedule.daily_time);
         let now = Local::now();
         let today = now.date_naive();
         let next_dt = if now.time() < target {
@@ -833,58 +904,50 @@ async fn daily_scheduler_loop(
             (today + Duration::days(1)).and_time(target)
         };
         let secs = (next_dt - now.naive_local()).num_seconds().max(0) as u64;
-        info!("Next daily summary in {secs}s (at {hour:02}:{minute:02})");
-        sleep(TokioDuration::from_secs(secs)).await;
-        check_and_post(&state, &client, &http, &config).await;
+        info!("Next daily summary in {secs}s (at {})", schedule.daily_time);
+        if sleep_until_or_changed(secs, &mut changes).await {
+            check_and_post(&state, schedule.daily_post_if_empty).await;
+        }
     }
 }
 
-async fn check_and_post_weekly(
-    _state: &BotState,
-    client: &Client,
-    http: &reqwest::Client,
-    config: &CalendarConfig,
-) {
+async fn check_and_post_weekly(state: &BotState, post_if_empty: bool) {
     let week_start = Local::now().date_naive();
-    let week_days = get_week_events(http, config, week_start).await;
+    let week_days = get_week_events(&state.http, &state.config, week_start).await;
     let total: usize = week_days.iter().map(|(_, evs)| evs.len()).sum();
 
-    if total == 0 && !config.weekly.post_if_empty {
+    if total == 0 && !post_if_empty {
         info!("No events this week — staying silent");
         return;
     }
 
     let (plain, html) = format_week_message(week_start, &week_days);
     info!("Posting weekly summary ({total} event(s)) to Matrix");
-
-    for room in client.joined_rooms() {
-        if let Err(e) = room
-            .send(RoomMessageEventContent::text_html(&plain, &html))
-            .await
-        {
-            error!("Failed to send weekly summary to {}: {e}", room.room_id());
-        }
-    }
+    state.broadcast("weekly summary", &plain, &html).await;
 }
 
-async fn weekly_scheduler_loop(
-    state: BotState,
-    client: Client,
-    http: reqwest::Client,
-    config: CalendarConfig,
-    test_mode: bool,
-) {
+async fn weekly_scheduler_loop(state: BotState, test_mode: bool) {
     if test_mode {
-        info!("Test mode: posting weekly summary immediately");
-        check_and_post_weekly(&state, &client, &http, &config).await;
+        let schedule = state.schedule.get();
+        if schedule.weekly_enabled {
+            info!("Test mode: posting weekly summary immediately");
+            check_and_post_weekly(&state, schedule.weekly_post_if_empty).await;
+        }
         return;
     }
 
-    let weekday = parse_weekday(&config.weekly.day);
-    let (hour, minute) = parse_hm(&config.weekly.time);
-    let target_time = NaiveTime::from_hms_opt(hour, minute, 0).expect("invalid weekly time");
-
+    let mut changes = state.schedule.store().subscribe();
     loop {
+        let schedule = state.schedule.get();
+        if !schedule.weekly_enabled {
+            info!("Weekly summary disabled");
+            if changes.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let weekday = parse_weekday(&schedule.weekly_day);
+        let target_time = naive_time(schedule.weekly_time);
         let now = Local::now();
         let today = now.date_naive();
 
@@ -903,11 +966,13 @@ async fn weekly_scheduler_loop(
         let target_dt = target_date.and_time(target_time);
         let secs = (target_dt - now.naive_local()).num_seconds().max(0) as u64;
         info!(
-            "Next weekly summary in {secs}s (on {} at {hour:02}:{minute:02})",
-            target_date.format("%A %d %b")
+            "Next weekly summary in {secs}s (on {} at {})",
+            target_date.format("%A %d %b"),
+            schedule.weekly_time
         );
-        sleep(TokioDuration::from_secs(secs)).await;
-        check_and_post_weekly(&state, &client, &http, &config).await;
+        if sleep_until_or_changed(secs, &mut changes).await {
+            check_and_post_weekly(&state, schedule.weekly_post_if_empty).await;
+        }
     }
 }
 
@@ -997,52 +1062,43 @@ fn format_month_message(
     (plain_lines.join("\n"), html_lines.join("<br>"))
 }
 
-async fn check_and_post_monthly(
-    _state: &BotState,
-    client: &Client,
-    http: &reqwest::Client,
-    config: &CalendarConfig,
-) {
+async fn check_and_post_monthly(state: &BotState, post_if_empty: bool) {
     let today = Local::now().date_naive();
-    let month_days = get_month_events(http, config, today).await;
+    let month_days = get_month_events(&state.http, &state.config, today).await;
     let total: usize = month_days.iter().map(|(_, evs)| evs.len()).sum();
 
-    if total == 0 && !config.monthly.post_if_empty {
+    if total == 0 && !post_if_empty {
         info!("No events this month — staying silent");
         return;
     }
 
     let (plain, html) = format_month_message(today, &month_days);
     info!("Posting monthly summary ({total} event(s)) to Matrix");
-
-    for room in client.joined_rooms() {
-        if let Err(e) = room
-            .send(RoomMessageEventContent::text_html(&plain, &html))
-            .await
-        {
-            error!("Failed to send monthly summary to {}: {e}", room.room_id());
-        }
-    }
+    state.broadcast("monthly summary", &plain, &html).await;
 }
 
-async fn monthly_scheduler_loop(
-    state: BotState,
-    client: Client,
-    http: reqwest::Client,
-    config: CalendarConfig,
-    test_mode: bool,
-) {
+async fn monthly_scheduler_loop(state: BotState, test_mode: bool) {
     if test_mode {
-        info!("Test mode: posting monthly summary immediately");
-        check_and_post_monthly(&state, &client, &http, &config).await;
+        let schedule = state.schedule.get();
+        if schedule.monthly_enabled {
+            info!("Test mode: posting monthly summary immediately");
+            check_and_post_monthly(&state, schedule.monthly_post_if_empty).await;
+        }
         return;
     }
 
-    let (hour, minute) = parse_hm(&config.monthly.time);
-    let target_time = NaiveTime::from_hms_opt(hour, minute, 0).expect("invalid monthly time");
-    let dom = config.monthly.day.clamp(1, 31);
-
+    let mut changes = state.schedule.store().subscribe();
     loop {
+        let schedule = state.schedule.get();
+        if !schedule.monthly_enabled {
+            info!("Monthly summary disabled");
+            if changes.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let target_time = naive_time(schedule.monthly_time);
+        let dom = schedule.monthly_day.clamp(1, 31);
         let now = Local::now();
         let today = now.date_naive();
 
@@ -1062,241 +1118,77 @@ async fn monthly_scheduler_loop(
         let target_dt = target_date.and_time(target_time);
         let secs = (target_dt - now.naive_local()).num_seconds().max(0) as u64;
         info!(
-            "Next monthly summary in {secs}s (on {} at {hour:02}:{minute:02})",
-            target_date.format("%d %b %Y")
+            "Next monthly summary in {secs}s (on {} at {})",
+            target_date.format("%d %b %Y"),
+            schedule.monthly_time
         );
-        sleep(TokioDuration::from_secs(secs)).await;
-        check_and_post_monthly(&state, &client, &http, &config).await;
+        if sleep_until_or_changed(secs, &mut changes).await {
+            check_and_post_monthly(&state, schedule.monthly_post_if_empty).await;
+        }
     }
 }
 
-// ── Verification ──────────────────────────────────────────────────────────────
-
 // ── Main ──────────────────────────────────────────────────────────────────────
+
+const ADMIN_HELP: &str = "Runtime settings (!admin settings): daily_*, weekly_*, monthly_* \
+enabled / time / day / post_if_empty";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "calendar_bot=info,matrix_sdk=warn".parse().unwrap()),
-        )
-        .init();
+    mxbot_common::logging::init("calendar_bot");
 
     let test_mode = std::env::args().any(|a| a == "--test");
-    let config_path = std::env::args()
-        .find(|a| a.ends_with(".toml"))
-        .unwrap_or_else(|| "config.toml".to_owned());
-
-    let config_str = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("Failed to read config: {config_path}"))?;
-    let config: Config = toml::from_str(&config_str)?;
+    let config: Config =
+        mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
 
     if config.calendar.sources.is_empty() {
         anyhow::bail!("Config [calendar]: add at least one [[calendar.sources]] entry");
     }
 
-    let store_path =
-        PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
-    let (client, user_id) = mxbot_common::session::build_and_restore(
-        &config.matrix,
-        &store_path,
-        config.security.encryption_strategy.into(),
+    let store_path = mxbot_common::config::store_path_from_env();
+    let schedule = Settings::load(
+        store_path.join("settings.json"),
+        Schedule::from_config(&config.calendar),
     )
     .await?;
 
-    let allowed_inviters: HashSet<OwnedUserId> = config
-        .security
-        .allowed_inviters
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    if allowed_inviters.is_empty() {
-        warn!("No allowed_inviters configured — bot accepts invites from anyone");
-    } else {
-        info!("Allowed inviters: {allowed_inviters:?}");
-    }
-
-    let admin_users: HashSet<OwnedUserId> = config
-        .security
-        .admin_users
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    let verification = VerificationService::allowlisted_tofu_from_config(
-        client.clone(),
-        &config.security.verification,
-        &config.security.allowed_inviters,
-    );
-    verification.install_handlers();
-
-    if admin_users.is_empty() {
-        warn!("No admin_users configured — !reset-trust command is disabled");
-    } else {
-        info!("Admin users: {admin_users:?}");
-    }
-
-    let bot_state = BotState {
-        bot_user_id: user_id,
-        allowed_inviters,
-        admin_users,
-        verification,
-    };
-
-    // Invite handler
-    client.add_event_handler({
-        let state = bot_state.clone();
-        move |ev: StrippedRoomMemberEvent, room: Room, client: Client| {
-            let state = state.clone();
-            async move {
-                if ev.state_key != state.bot_user_id {
-                    return;
-                }
-                if !state.allowed_inviters.is_empty() && !state.allowed_inviters.contains(&ev.sender) {
-                    warn!("Rejecting invite from {} (not in allowed_inviters)", ev.sender);
-                    room.leave().await.ok();
-                    return;
-                }
-                info!("Accepted invite from {} to {}", ev.sender, room.room_id());
-                let room_id = room.room_id().to_owned();
-                let mut via: Vec<OwnedServerName> = vec![ev.sender.server_name().to_owned()];
-                if let Some(s) = room_id.server_name() {
-                    let s = s.to_owned();
-                    if !via.contains(&s) {
-                        via.push(s);
-                    }
-                }
-                let room_or_alias = match RoomOrAliasId::parse(room_id.as_str()) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        error!("Invalid room ID {room_id}: {e}");
-                        return;
-                    }
-                };
-                tokio::spawn(async move {
-                    let mut delay = 2u64;
-                    const MAX_ATTEMPTS: u32 = 8;
-                    for attempt in 1..=MAX_ATTEMPTS {
-                        match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
-                            Ok(_) => {
-                                info!("Joined {room_id}");
-                                return;
-                            }
-                            Err(ref e) if mxbot_common::verify::is_join_terminal(e) => {
-                                warn!("Join failed (terminal) for {room_id}: {e}");
-                                return;
-                            }
-                            Err(e) if attempt == MAX_ATTEMPTS => {
-                                warn!("Join failed after {MAX_ATTEMPTS} attempts for {room_id}: {e}");
-                            }
-                            Err(e) => {
-                                warn!("Join attempt {attempt}/{MAX_ATTEMPTS} failed for {room_id}: {e}; retry in {delay}s");
-                                sleep(TokioDuration::from_secs(delay)).await;
-                                delay = (delay * 2).min(300);
-                            }
-                        }
-                    }
-                });
-            }
-        }
-    });
-
-    // In-room messages: verification requests are handled by mxbot-common.
-    client.add_event_handler({
-        let state = bot_state.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
-            let state = state.clone();
-            async move {
-                if ev.sender == state.bot_user_id || room.state() != RoomState::Joined {
-                    return;
-                }
-                if let MessageType::VerificationRequest(_) = &ev.content.msgtype {
-                    return;
-                }
-                let MessageType::Text(ref text) = ev.content.msgtype else {
-                    return;
-                };
-                state
-                    .verification
-                    .handle_admin_command(&ev.sender, &state.admin_users, text.body.trim())
-                    .await;
-            }
-        }
-    });
-
-    let http = reqwest::Client::new();
-
-    if config.calendar.daily.enabled {
-        tokio::spawn(daily_scheduler_loop(
-            bot_state.clone(),
-            client.clone(),
-            http.clone(),
-            config.calendar.clone(),
-            test_mode,
-        ));
-    }
-
-    if config.calendar.weekly.enabled {
-        tokio::spawn(weekly_scheduler_loop(
-            bot_state.clone(),
-            client.clone(),
-            http.clone(),
-            config.calendar.clone(),
-            test_mode,
-        ));
-    }
-
-    if config.calendar.monthly.enabled {
-        tokio::spawn(monthly_scheduler_loop(
-            bot_state.clone(),
-            client.clone(),
-            http.clone(),
-            config.calendar.clone(),
-            test_mode,
-        ));
-    }
-
-    info!("Starting sync...");
-    let filter = FilterDefinition::with_lazy_loading();
-    client
-        .sync_once(SyncSettings::default().filter(filter.clone().into()))
+    let bot = Bot::builder("calendar-bot", env!("CARGO_PKG_VERSION"))
+        .store_path(&store_path)
+        .settings(schedule.store().clone())
+        .admin_help(ADMIN_HELP)
+        .start(&config.matrix, &config.security)
         .await?;
 
-    // Drain pending invites from prior sessions.
-    let invited = client.invited_rooms();
-    if !invited.is_empty() {
-        info!(
-            "Pending invite(s) found after initial sync — joining {} room(s)",
-            invited.len()
-        );
-        for room in invited {
-            let room_id = room.room_id().to_owned();
-            let via: Vec<OwnedServerName> = room_id
-                .server_name()
-                .map(|s| vec![s.to_owned()])
-                .unwrap_or_default();
-            match RoomOrAliasId::parse(room_id.as_str()) {
-                Ok(room_or_alias) => {
-                    match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
-                        Ok(_) => info!("Joined pending invite room {room_id}"),
-                        Err(e) => warn!("Failed to join pending invite room {room_id}: {e}"),
-                    }
-                }
-                Err(e) => warn!("Invalid room ID in pending invite {room_id}: {e}"),
-            }
-        }
-    }
+    // In-room messages: only the shared admin console applies here.
+    install_message_handler(&bot);
 
-    loop {
-        match client
-            .sync(SyncSettings::default().filter(filter.clone().into()))
-            .await
-        {
-            Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
-            Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
-        }
-        sleep(TokioDuration::from_secs(5)).await;
-    }
+    let state = BotState {
+        bot: bot.clone(),
+        http: reqwest::Client::new(),
+        config: config.calendar,
+        schedule,
+    };
+
+    tokio::spawn(daily_scheduler_loop(state.clone(), test_mode));
+    tokio::spawn(weekly_scheduler_loop(state.clone(), test_mode));
+    tokio::spawn(monthly_scheduler_loop(state, test_mode));
+
+    info!("Starting sync...");
+    bot.initial_sync().await;
+    bot.sync_forever().await
+}
+
+fn install_message_handler(bot: &Bot) {
+    let admin = bot.admin.clone();
+    bot.client.add_event_handler(
+        move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
+            let admin = admin.clone();
+            async move {
+                if room.state() != RoomState::Joined {
+                    return;
+                }
+                admin.handle(&room, &ev, encryption.as_ref()).await;
+            }
+        },
+    );
 }

@@ -1,5 +1,10 @@
 [calendar]
 # Add one [[calendar.sources]] block per calendar (see below).
+#
+# The daily/weekly/monthly values below are defaults: admins can change them
+# at runtime in a direct chat with the bot, e.g. `!admin set daily_time 06:30`
+# or `!admin set weekly_enabled true` (see `!admin settings`). Changes are
+# persisted in store/settings.json; `!admin unset <key>` reverts to this file.
 
 # Daily summary — posted every day at the configured time.
 # enabled defaults to true, so omitting this section keeps the daily reminder on.
@@ -50,17 +55,19 @@ password = "yourapppassword"
 [matrix]
 homeserver = "https://matrix.org"
 user_id = "@yourbot:matrix.org"
+# Secrets may instead come from MATRIX_ACCESS_TOKEN / MATRIX_RECOVERY_KEY.
 access_token = "syt_YOUR_ACCESS_TOKEN"
 device_id = "YOUR_DEVICE_ID"
 # Optional: security key from Element's "Set up Secure Backup"
 # recovery_key = "EsXX xxxx xxxx xxxx xxxx xxxx xxxx xxxx"
 
 [security]
-# Users allowed to invite the bot to Matrix rooms. Empty = accept from anyone.
+# Users allowed to invite the bot ("all" = anyone, [] = nobody).
+# Configured admins may always open a direct chat with the bot.
 allowed_inviters = ["@you:matrix.org"]
 
-# Users allowed to run !reset-trust @user:server to let a user re-verify.
-# If empty (default), nobody can reset trust — the bot only trusts the first verification.
+# Users allowed to run admin commands — in shared rooms and privately in a
+# direct chat with the bot (send !admin there for help).
 admin_users = ["@you:matrix.org"]
 
 # Which devices receive room keys:
@@ -79,3 +86,16 @@ allow_users_from_joined_rooms = false
 flow_timeout_secs = 300
 grant_ttl_secs = 600
 max_concurrent = 8
+
+[security.admin_dm]
+# Admins can open a direct chat with the bot and manage it there:
+#   !admin status | verify | settings | set <key> <value> | unset <key>
+# `!admin verify` starts mutual emoji (SAS) verification with you.
+enabled = true
+# Only accept admin commands in end-to-end encrypted direct chats.
+require_encryption = true
+# Only accept admin commands from devices the bot has verified (recommended
+# once you and the bot have verified each other).
+require_verified_device = false
+# Also deliver broadcast posts (summaries, digests, …) into admin chats.
+receive_broadcasts = false
