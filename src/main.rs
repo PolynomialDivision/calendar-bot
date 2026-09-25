@@ -340,7 +340,6 @@ fn weekday_code(wd: Weekday) -> &'static str {
     }
 }
 
-/// Returns true if the recurring event with start date `start` and RRULE `rule`
 /// Check if `today` matches a MONTHLY BYDAY entry like "3TH" (3rd Thursday) or "-1FR" (last Friday).
 fn monthly_byday_matches(d: &str, today: NaiveDate) -> bool {
     let len = d.len();
@@ -380,6 +379,7 @@ fn monthly_byday_matches(d: &str, today: NaiveDate) -> bool {
     }
 }
 
+/// Returns true if the recurring event with start date `start` and RRULE `rule`
 /// has an occurrence on `today`. Handles FREQ=DAILY/WEEKLY/MONTHLY/YEARLY,
 /// BYDAY, and UNTIL.
 fn rrule_matches(start: NaiveDate, rule: &str, today: NaiveDate) -> bool {
@@ -871,6 +871,47 @@ async fn check_and_post(state: &BotState, post_if_empty: bool) {
     state.broadcast("daily summary", &plain, &html).await;
 }
 
+/// The next time `time` occurs strictly after `now` (today or tomorrow).
+fn next_daily_run(now: NaiveDateTime, time: NaiveTime) -> NaiveDateTime {
+    let today = now.date();
+    if now.time() < time {
+        today.and_time(time)
+    } else {
+        (today + Duration::days(1)).and_time(time)
+    }
+}
+
+/// The next `weekday` at `time` after `now`; a week later if that moment
+/// has already passed today.
+fn next_weekly_run(now: NaiveDateTime, weekday: Weekday, time: NaiveTime) -> NaiveDateTime {
+    let today = now.date();
+    let days_until = (weekday.num_days_from_monday() as i64
+        - today.weekday().num_days_from_monday() as i64)
+        .rem_euclid(7);
+    let days_until = if days_until == 0 && now.time() >= time {
+        7
+    } else {
+        days_until
+    };
+    (today + Duration::days(days_until)).and_time(time)
+}
+
+/// The next day-of-month `day` (1–31, clamped to short months) at `time`
+/// after `now`: this month if still ahead, otherwise next month.
+fn next_monthly_run(now: NaiveDateTime, day: u32, time: NaiveTime) -> NaiveDateTime {
+    let today = now.date();
+    let day = day.clamp(1, 31);
+    let candidate = month_day(today.year(), today.month(), day);
+    let date = if candidate > today || (candidate == today && now.time() < time) {
+        candidate
+    } else if today.month() == 12 {
+        month_day(today.year() + 1, 1, day)
+    } else {
+        month_day(today.year(), today.month() + 1, day)
+    };
+    date.and_time(time)
+}
+
 fn naive_time(t: TimeOfDay) -> NaiveTime {
     NaiveTime::from_hms_opt(t.hour, t.minute, 0).expect("TimeOfDay is validated")
 }
@@ -895,15 +936,9 @@ async fn daily_scheduler_loop(state: BotState, test_mode: bool) {
             }
             continue;
         }
-        let target = naive_time(schedule.daily_time);
-        let now = Local::now();
-        let today = now.date_naive();
-        let next_dt = if now.time() < target {
-            today.and_time(target)
-        } else {
-            (today + Duration::days(1)).and_time(target)
-        };
-        let secs = (next_dt - now.naive_local()).num_seconds().max(0) as u64;
+        let now = Local::now().naive_local();
+        let next_dt = next_daily_run(now, naive_time(schedule.daily_time));
+        let secs = (next_dt - now).num_seconds().max(0) as u64;
         info!("Next daily summary in {secs}s (at {})", schedule.daily_time);
         if sleep_until_or_changed(secs, &mut changes).await {
             check_and_post(&state, schedule.daily_post_if_empty).await;
@@ -946,28 +981,16 @@ async fn weekly_scheduler_loop(state: BotState, test_mode: bool) {
             }
             continue;
         }
-        let weekday = parse_weekday(&schedule.weekly_day);
-        let target_time = naive_time(schedule.weekly_time);
-        let now = Local::now();
-        let today = now.date_naive();
-
-        // Days until the next occurrence of the configured weekday.
-        let days_until = (weekday.num_days_from_monday() as i64
-            - today.weekday().num_days_from_monday() as i64)
-            .rem_euclid(7);
-        // If today is that weekday but the time has passed, jump to next week.
-        let days_until = if days_until == 0 && now.time() >= target_time {
-            7
-        } else {
-            days_until
-        };
-
-        let target_date = today + Duration::days(days_until);
-        let target_dt = target_date.and_time(target_time);
-        let secs = (target_dt - now.naive_local()).num_seconds().max(0) as u64;
+        let now = Local::now().naive_local();
+        let target_dt = next_weekly_run(
+            now,
+            parse_weekday(&schedule.weekly_day),
+            naive_time(schedule.weekly_time),
+        );
+        let secs = (target_dt - now).num_seconds().max(0) as u64;
         info!(
             "Next weekly summary in {secs}s (on {} at {})",
-            target_date.format("%A %d %b"),
+            target_dt.format("%A %d %b"),
             schedule.weekly_time
         );
         if sleep_until_or_changed(secs, &mut changes).await {
@@ -1097,29 +1120,13 @@ async fn monthly_scheduler_loop(state: BotState, test_mode: bool) {
             }
             continue;
         }
-        let target_time = naive_time(schedule.monthly_time);
-        let dom = schedule.monthly_day.clamp(1, 31);
-        let now = Local::now();
-        let today = now.date_naive();
-
-        // Try this month's target date first, then next month if already passed.
-        let candidate = month_day(today.year(), today.month(), dom);
-        let target_date = if candidate > today || (candidate == today && now.time() < target_time) {
-            candidate
-        } else {
-            let (ny, nm) = if today.month() == 12 {
-                (today.year() + 1, 1)
-            } else {
-                (today.year(), today.month() + 1)
-            };
-            month_day(ny, nm, dom)
-        };
-
-        let target_dt = target_date.and_time(target_time);
-        let secs = (target_dt - now.naive_local()).num_seconds().max(0) as u64;
+        let now = Local::now().naive_local();
+        let target_dt =
+            next_monthly_run(now, schedule.monthly_day, naive_time(schedule.monthly_time));
+        let secs = (target_dt - now).num_seconds().max(0) as u64;
         info!(
             "Next monthly summary in {secs}s (on {} at {})",
-            target_date.format("%d %b %Y"),
+            target_dt.format("%d %b %Y"),
             schedule.monthly_time
         );
         if sleep_until_or_changed(secs, &mut changes).await {
@@ -1175,7 +1182,7 @@ async fn main() -> Result<()> {
 
     info!("Starting sync...");
     bot.initial_sync().await;
-    bot.sync_forever().await
+    bot.run().await
 }
 
 fn install_message_handler(bot: &Bot) {
@@ -1191,4 +1198,164 @@ fn install_message_handler(bot: &Bot) {
             }
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn at(y: i32, m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
+        date(y, m, d).and_hms_opt(h, min, 0).unwrap()
+    }
+
+    fn hm(h: u32, m: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn daily_run_is_today_until_the_time_passes() {
+        assert_eq!(
+            next_daily_run(at(2026, 9, 25, 6, 59), hm(7, 0)),
+            at(2026, 9, 25, 7, 0)
+        );
+        assert_eq!(
+            next_daily_run(at(2026, 9, 25, 7, 0), hm(7, 0)),
+            at(2026, 9, 26, 7, 0)
+        );
+    }
+
+    #[test]
+    fn weekly_run_targets_the_next_matching_weekday() {
+        // 2026-09-25 is a Friday.
+        assert_eq!(
+            next_weekly_run(at(2026, 9, 25, 12, 0), Weekday::Mon, hm(7, 0)),
+            at(2026, 9, 28, 7, 0)
+        );
+        assert_eq!(
+            next_weekly_run(at(2026, 9, 25, 6, 0), Weekday::Fri, hm(7, 0)),
+            at(2026, 9, 25, 7, 0)
+        );
+        assert_eq!(
+            next_weekly_run(at(2026, 9, 25, 8, 0), Weekday::Fri, hm(7, 0)),
+            at(2026, 10, 2, 7, 0)
+        );
+    }
+
+    #[test]
+    fn monthly_run_clamps_to_short_months_and_rolls_over_the_year() {
+        assert_eq!(
+            next_monthly_run(at(2026, 4, 2, 8, 0), 31, hm(7, 0)),
+            at(2026, 4, 30, 7, 0)
+        );
+        assert_eq!(
+            next_monthly_run(at(2026, 2, 1, 6, 0), 1, hm(7, 0)),
+            at(2026, 2, 1, 7, 0)
+        );
+        assert_eq!(
+            next_monthly_run(at(2026, 12, 15, 8, 0), 1, hm(7, 0)),
+            at(2027, 1, 1, 7, 0)
+        );
+        assert_eq!(
+            next_monthly_run(at(2026, 1, 31, 8, 0), 31, hm(7, 0)),
+            at(2026, 2, 28, 7, 0)
+        );
+    }
+
+    #[test]
+    fn weekday_names_default_to_monday() {
+        assert_eq!(parse_weekday("Friday"), Weekday::Fri);
+        assert_eq!(parse_weekday("sun"), Weekday::Sun);
+        assert_eq!(parse_weekday("nonsense"), Weekday::Mon);
+    }
+
+    #[test]
+    fn rrule_handles_weekly_monthly_byday_and_until() {
+        let start = date(2026, 1, 5); // Monday
+        assert!(rrule_matches(start, "FREQ=WEEKLY", date(2026, 9, 28)));
+        assert!(!rrule_matches(start, "FREQ=WEEKLY", date(2026, 9, 29)));
+        assert!(rrule_matches(
+            start,
+            "FREQ=WEEKLY;BYDAY=MO,WE",
+            date(2026, 9, 30)
+        ));
+        // Third Thursday and last Friday of September 2026.
+        assert!(rrule_matches(
+            start,
+            "FREQ=MONTHLY;BYDAY=3TH",
+            date(2026, 9, 17)
+        ));
+        assert!(rrule_matches(
+            start,
+            "FREQ=MONTHLY;BYDAY=-1FR",
+            date(2026, 9, 25)
+        ));
+        assert!(!rrule_matches(
+            start,
+            "FREQ=MONTHLY;BYDAY=-1FR",
+            date(2026, 9, 18)
+        ));
+        assert!(!rrule_matches(
+            start,
+            "FREQ=DAILY;UNTIL=20260301",
+            date(2026, 3, 2)
+        ));
+        assert!(!rrule_matches(
+            date(2026, 10, 1),
+            "FREQ=DAILY",
+            date(2026, 9, 30)
+        ));
+    }
+
+    #[test]
+    fn ics_events_are_parsed_filtered_and_sorted() {
+        let ics = "BEGIN:VCALENDAR\r\n\
+            BEGIN:VEVENT\r\nSUMMARY:Plenum\\, groß\r\nDTSTART:20260925T190000\r\nLOCATION:Kü\r\n che\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nSUMMARY:Holiday\r\nDTSTART;VALUE=DATE:20260925\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nSUMMARY:Standup\r\nDTSTART:20260901T090000\r\nRRULE:FREQ=DAILY\r\nEXDATE:20260925T090000\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nSUMMARY:Breakfast\r\nDTSTART:20260925T080000\r\nEND:VEVENT\r\n\
+            END:VCALENDAR\r\n";
+        let events = parse_ics(ics);
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].summary, "Plenum, groß");
+        assert_eq!(events[0].location.as_deref(), Some("Küche"));
+
+        let today = events_for_today(&events, date(2026, 9, 25));
+        let summaries: Vec<&str> = today.iter().map(|e| e.summary.as_str()).collect();
+        // Timed events by time, all-day last; the excluded recurrence is gone.
+        assert_eq!(summaries, ["Breakfast", "Plenum, groß", "Holiday"]);
+    }
+
+    #[test]
+    fn today_message_escapes_html_and_handles_empty_days() {
+        let (plain, _) = format_today_message(date(2026, 9, 25), &[]);
+        assert!(plain.starts_with("📅 No events today"));
+
+        let events = [DayEvent {
+            time: EventTime::AllDay,
+            summary: "<b>Party</b>".into(),
+            location: Some("A & B".into()),
+        }];
+        let (plain, html) = format_today_message(date(2026, 9, 25), &events);
+        assert!(plain.contains("• All day <b>Party</b> [A & B]"));
+        assert!(html.contains("&lt;b&gt;Party&lt;/b&gt; <em>[A &amp; B]</em>"));
+    }
+
+    #[test]
+    fn runtime_schedule_defaults_come_from_the_config() {
+        let config: CalendarConfig = toml::from_str(
+            "sources = []\n[weekly]\nenabled = true\nday = \"friday\"\ntime = \"18:30\"",
+        )
+        .unwrap();
+        let schedule = Schedule::from_config(&config);
+        assert!(schedule.daily_enabled);
+        assert_eq!(schedule.daily_time, TimeOfDay::new(7, 0));
+        assert!(schedule.weekly_enabled);
+        assert_eq!(schedule.weekly_day, "friday");
+        assert_eq!(schedule.weekly_time, TimeOfDay::new(18, 30));
+        assert!(!schedule.monthly_enabled);
+    }
 }
