@@ -1,10 +1,15 @@
+mod ics;
+mod render;
+
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 use mxbot_common::{
     config::{MatrixConfig, SecurityConfig, TimeOfDay},
     matrix_sdk::{
         deserialized_responses::EncryptionInfo,
-        ruma::events::room::message::{OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+        ruma::events::room::message::{
+            MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+        },
         Room, RoomState,
     },
     settings::Settings,
@@ -228,274 +233,6 @@ async fn sleep_until_or_changed(secs: u64, changes: &mut watch::Receiver<u64>) -
     }
 }
 
-// ── ICS parsing ───────────────────────────────────────────────────────────────
-
-#[derive(Debug, Default)]
-struct IcsEvent {
-    summary: String,
-    dtstart: String,
-    dtstart_is_date: bool, // VALUE=DATE or 8-char YYYYMMDD
-    location: Option<String>,
-    description: Option<String>,
-    rrule: Option<String>,
-    exdates: Vec<String>,
-}
-
-/// RFC 5545 §3.1: unfold long lines (continuation lines start with space/tab).
-fn unfold(ics: &str) -> String {
-    ics.replace("\r\n ", "")
-        .replace("\r\n\t", "")
-        .replace("\n ", "")
-        .replace("\n\t", "")
-}
-
-/// Unescape ICS text values (commas, semicolons, newlines, backslashes).
-fn unescape(s: &str) -> String {
-    s.replace("\\n", "\n")
-        .replace("\\N", "\n")
-        .replace("\\,", ",")
-        .replace("\\;", ";")
-        .replace("\\\\", "\\")
-}
-
-fn parse_ics(ics: &str) -> Vec<IcsEvent> {
-    let unfolded = unfold(ics);
-    let mut events: Vec<IcsEvent> = Vec::new();
-    let mut current: Option<IcsEvent> = None;
-
-    for raw_line in unfolded.lines() {
-        let line = raw_line.trim_end_matches('\r');
-
-        if line == "BEGIN:VEVENT" {
-            current = Some(IcsEvent::default());
-            continue;
-        }
-        if line == "END:VEVENT" {
-            if let Some(ev) = current.take() {
-                if !ev.dtstart.is_empty() {
-                    events.push(ev);
-                }
-            }
-            continue;
-        }
-
-        let Some(ref mut ev) = current else { continue };
-
-        // Split "KEY;PARAMS:VALUE" — the first colon separates key+params from value.
-        let Some(colon) = line.find(':') else {
-            continue;
-        };
-        let key_part = &line[..colon];
-        let value = &line[colon + 1..];
-
-        // Split "KEY;PARAMS" into key name and params string.
-        let (key_name, params) = key_part
-            .find(';')
-            .map(|i| (&key_part[..i], &key_part[i + 1..]))
-            .unwrap_or((key_part, ""));
-
-        match key_name {
-            "SUMMARY" => ev.summary = unescape(value),
-            "DTSTART" => {
-                ev.dtstart = value.to_owned();
-                // VALUE=DATE param, or bare 8-char string = all-day
-                ev.dtstart_is_date = params.contains("VALUE=DATE") || value.len() == 8;
-            }
-            "LOCATION" => ev.location = Some(unescape(value)),
-            "DESCRIPTION" => ev.description = Some(unescape(value)),
-            "RRULE" => ev.rrule = Some(value.to_owned()),
-            "EXDATE" => ev.exdates.push(value[..8.min(value.len())].to_owned()),
-            _ => {}
-        }
-    }
-
-    events
-}
-
-/// Parse ICS date string (YYYYMMDD or YYYYMMDDTHHMMSS[Z]) → NaiveDate.
-fn parse_dtstart_date(s: &str) -> Option<NaiveDate> {
-    let s = s.trim_end_matches('Z');
-    NaiveDate::parse_from_str(&s[..8.min(s.len())], "%Y%m%d").ok()
-}
-
-/// Parse ICS datetime string (YYYYMMDDTHHMMSS[Z]) → NaiveDateTime (local/float).
-fn parse_dtstart_datetime(s: &str) -> Option<NaiveDateTime> {
-    let s = s.trim_end_matches('Z');
-    if s.len() >= 15 {
-        NaiveDateTime::parse_from_str(&s[..15], "%Y%m%dT%H%M%S").ok()
-    } else {
-        None
-    }
-}
-
-fn weekday_code(wd: Weekday) -> &'static str {
-    match wd {
-        Weekday::Mon => "MO",
-        Weekday::Tue => "TU",
-        Weekday::Wed => "WE",
-        Weekday::Thu => "TH",
-        Weekday::Fri => "FR",
-        Weekday::Sat => "SA",
-        Weekday::Sun => "SU",
-    }
-}
-
-/// Check if `today` matches a MONTHLY BYDAY entry like "3TH" (3rd Thursday) or "-1FR" (last Friday).
-fn monthly_byday_matches(d: &str, today: NaiveDate) -> bool {
-    let len = d.len();
-    if len < 2 {
-        return false;
-    }
-    // Weekday code is always the last 2 chars (MO TU WE TH FR SA SU).
-    let wd_str = &d[len - 2..];
-    let prefix = &d[..len - 2];
-
-    if wd_str != weekday_code(today.weekday()) {
-        return false;
-    }
-
-    let ordinal: i32 = if prefix.is_empty() {
-        return true; // no ordinal = any occurrence of this weekday
-    } else {
-        match prefix.parse::<i32>() {
-            Ok(n) => n,
-            Err(_) => return false,
-        }
-    };
-
-    if ordinal > 0 {
-        // (day - 1) / 7 + 1 gives the occurrence number within the month (1-based).
-        ((today.day() - 1) / 7 + 1) as i32 == ordinal
-    } else {
-        // Negative ordinal: count from end of month. -1 = last occurrence.
-        let next_month = if today.month() == 12 {
-            NaiveDate::from_ymd_opt(today.year() + 1, 1, 1).unwrap()
-        } else {
-            NaiveDate::from_ymd_opt(today.year(), today.month() + 1, 1).unwrap()
-        };
-        let last_day = next_month - Duration::days(1);
-        let days_from_end = (last_day - today).num_days() as i32;
-        -((days_from_end / 7) + 1) == ordinal
-    }
-}
-
-/// Returns true if the recurring event with start date `start` and RRULE `rule`
-/// has an occurrence on `today`. Handles FREQ=DAILY/WEEKLY/MONTHLY/YEARLY,
-/// BYDAY, and UNTIL.
-fn rrule_matches(start: NaiveDate, rule: &str, today: NaiveDate) -> bool {
-    if start > today {
-        return false;
-    }
-
-    let mut freq = "";
-    let mut byday: Vec<&str> = Vec::new();
-    let mut until: Option<NaiveDate> = None;
-
-    for part in rule.split(';') {
-        if let Some(v) = part.strip_prefix("FREQ=") {
-            freq = v;
-        } else if let Some(v) = part.strip_prefix("BYDAY=") {
-            byday = v.split(',').collect();
-        } else if let Some(v) = part.strip_prefix("UNTIL=") {
-            until = NaiveDate::parse_from_str(&v[..8.min(v.len())], "%Y%m%d").ok();
-        }
-    }
-
-    if let Some(until_date) = until {
-        if today > until_date {
-            return false;
-        }
-    }
-
-    match freq {
-        "DAILY" => true,
-        "WEEKLY" => {
-            if byday.is_empty() {
-                start.weekday() == today.weekday()
-            } else {
-                let wd = weekday_code(today.weekday());
-                byday.iter().any(|d| d.contains(wd))
-            }
-        }
-        "MONTHLY" => {
-            if byday.is_empty() {
-                start.day() == today.day()
-            } else {
-                byday.iter().any(|d| monthly_byday_matches(d, today))
-            }
-        }
-        "YEARLY" => start.month() == today.month() && start.day() == today.day(),
-        _ => false,
-    }
-}
-
-#[derive(Debug)]
-enum EventTime {
-    AllDay,
-    At(NaiveDateTime),
-}
-
-#[derive(Debug)]
-struct DayEvent {
-    time: EventTime,
-    summary: String,
-    location: Option<String>,
-}
-
-impl DayEvent {
-    fn sort_key(&self) -> i64 {
-        match &self.time {
-            EventTime::At(dt) => dt.and_utc().timestamp(),
-            EventTime::AllDay => i64::MAX, // all-day events shown last
-        }
-    }
-}
-
-/// Filter parsed ICS events for those occurring on `today`.
-fn events_for_today(events: &[IcsEvent], today: NaiveDate) -> Vec<DayEvent> {
-    let mut result = Vec::new();
-
-    for ev in events {
-        let start_date = match parse_dtstart_date(&ev.dtstart) {
-            Some(d) => d,
-            None => continue,
-        };
-
-        let occurs_today = if let Some(rule) = &ev.rrule {
-            // Check recurrence
-            let today_str = today.format("%Y%m%d").to_string();
-            if ev.exdates.contains(&today_str) {
-                continue; // excluded
-            }
-            rrule_matches(start_date, rule, today)
-        } else {
-            start_date == today
-        };
-
-        if !occurs_today {
-            continue;
-        }
-
-        let time = if ev.dtstart_is_date {
-            EventTime::AllDay
-        } else {
-            match parse_dtstart_datetime(&ev.dtstart) {
-                Some(dt) => EventTime::At(dt),
-                None => EventTime::AllDay,
-            }
-        };
-
-        result.push(DayEvent {
-            time,
-            summary: ev.summary.clone(),
-            location: ev.location.clone(),
-        });
-    }
-
-    result.sort_by_key(|e| e.sort_key());
-    result
-}
-
 // ── Calendar fetching ─────────────────────────────────────────────────────────
 
 fn add_auth(req: reqwest::RequestBuilder, src: &CalendarSource) -> reqwest::RequestBuilder {
@@ -509,7 +246,47 @@ fn add_auth(req: reqwest::RequestBuilder, src: &CalendarSource) -> reqwest::Requ
 async fn fetch_ics_direct(http: &reqwest::Client, src: &CalendarSource) -> Result<String> {
     let url = src.ics_url.as_deref().context("No ics_url configured")?;
     let req = add_auth(http.get(url), src);
-    Ok(req.send().await?.text().await?)
+    Ok(req.send().await?.error_for_status()?.text().await?)
+}
+
+/// Undo XML escaping of `calendar-data` inside a CalDAV response, so "&amp;"
+/// in a title reads "&" (and "&#13;" line endings become real ones).
+fn xml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let decoded = rest.find(';').filter(|&end| end <= 10).and_then(|end| {
+            let entity = &rest[1..end];
+            let ch = match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                    .or_else(|| entity.strip_prefix('#').and_then(|d| d.parse().ok()))
+                    .and_then(char::from_u32),
+            };
+            ch.map(|c| (c, end))
+        });
+        match decoded {
+            Some((c, end)) => {
+                out.push(c);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 async fn fetch_ics_caldav(
@@ -548,7 +325,7 @@ async fn fetch_ics_caldav(
         src,
     );
 
-    let xml = req.send().await?.text().await?;
+    let xml = xml_unescape(&req.send().await?.error_for_status()?.text().await?);
 
     let mut blocks = Vec::new();
     let mut pos = 0;
@@ -590,7 +367,7 @@ async fn discover_calendars(http: &reqwest::Client, src: &CalendarSource) -> Res
         src,
     );
 
-    let xml = req.send().await?.text().await?;
+    let xml = req.send().await?.error_for_status()?.text().await?;
 
     // Extract href values from responses that contain <C:calendar/> resourcetype.
     // We split by <D:response> blocks and keep those that declare a calendar collection.
@@ -670,14 +447,14 @@ async fn fetch_source_ics_events(
     src: &CalendarSource,
     start: NaiveDate,
     end: NaiveDate,
-) -> Result<Vec<IcsEvent>> {
+) -> Result<Vec<ics::IcsEvent>> {
     if src.caldav_account_url.is_some() {
         let calendar_urls = discover_calendars(http, src).await?;
         info!(
             "Discovered {} calendar(s) from account",
             calendar_urls.len()
         );
-        let mut all: Vec<IcsEvent> = Vec::new();
+        let mut all: Vec<ics::IcsEvent> = Vec::new();
         for url in &calendar_urls {
             let cal_src = CalendarSource {
                 caldav_url: Some(url.clone()),
@@ -688,187 +465,93 @@ async fn fetch_source_ics_events(
                 exclude: vec![],
             };
             match fetch_ics_caldav(http, &cal_src, start, end).await {
-                Ok(blocks) => blocks.iter().for_each(|b| all.extend(parse_ics(b))),
+                Ok(blocks) => blocks.iter().for_each(|b| all.extend(ics::parse_ics(b))),
                 Err(e) => warn!("Failed to fetch calendar {url}: {e}"),
             }
         }
         Ok(all)
     } else if src.caldav_url.is_some() {
         let blocks = fetch_ics_caldav(http, src, start, end).await?;
-        Ok(blocks.iter().flat_map(|b| parse_ics(b)).collect())
+        Ok(blocks.iter().flat_map(|b| ics::parse_ics(b)).collect())
     } else {
         let ics = fetch_ics_direct(http, src).await?;
-        Ok(parse_ics(&ics))
+        Ok(ics::parse_ics(&ics))
     }
 }
 
-async fn get_todays_events(
-    http: &reqwest::Client,
-    config: &CalendarConfig,
-    today: NaiveDate,
-) -> Vec<DayEvent> {
-    let mut all: Vec<IcsEvent> = Vec::new();
-    for (i, src) in config.sources.iter().enumerate() {
-        match fetch_source_ics_events(http, src, today, today + Duration::days(1)).await {
+/// Events of `days` days from `from`, plus how many sources failed.
+struct Loaded {
+    days: Vec<(NaiveDate, Vec<ics::DayEntry>)>,
+    failed: usize,
+    total: usize,
+}
+
+impl Loaded {
+    fn all_failed(&self) -> bool {
+        self.total > 0 && self.failed == self.total
+    }
+
+    fn event_count(&self) -> usize {
+        self.days.iter().map(|(_, e)| e.len()).sum()
+    }
+}
+
+async fn load(state: &BotState, from: NaiveDate, days: i64) -> Loaded {
+    let until = from + Duration::days(days);
+    let mut all = Vec::new();
+    let mut failed = 0;
+    for (i, src) in state.config.sources.iter().enumerate() {
+        match fetch_source_ics_events(&state.http, src, from, until).await {
             Ok(events) => {
                 info!("Source {}: {} raw event(s)", i + 1, events.len());
                 all.extend(events);
             }
-            Err(e) => warn!("Source {} failed: {e}", i + 1),
-        }
-    }
-    let mut result = events_for_today(&all, today);
-    result.sort_by_key(|e| e.sort_key());
-    result
-}
-
-/// Returns events grouped by day for a 7-day window starting at `week_start`.
-async fn get_week_events(
-    http: &reqwest::Client,
-    config: &CalendarConfig,
-    week_start: NaiveDate,
-) -> Vec<(NaiveDate, Vec<DayEvent>)> {
-    let week_end = week_start + Duration::days(7);
-    let mut all: Vec<IcsEvent> = Vec::new();
-    for (i, src) in config.sources.iter().enumerate() {
-        match fetch_source_ics_events(http, src, week_start, week_end).await {
-            Ok(events) => {
-                info!("Weekly source {}: {} raw event(s)", i + 1, events.len());
-                all.extend(events);
+            Err(e) => {
+                error!("Source {} failed: {e:#}", i + 1);
+                failed += 1;
             }
-            Err(e) => warn!("Weekly source {} failed: {e}", i + 1),
         }
     }
-    (0..7)
-        .map(|d| {
-            let day = week_start + Duration::days(d);
-            let mut events = events_for_today(&all, day);
-            events.sort_by_key(|e| e.sort_key());
-            (day, events)
-        })
-        .collect()
-}
-
-// ── Message formatting ────────────────────────────────────────────────────────
-
-fn format_today_message(today: NaiveDate, events: &[DayEvent]) -> (String, String) {
-    let day_str = today.format("%a %d %b %Y").to_string();
-
-    if events.is_empty() {
-        let plain = format!("📅 No events today ({day_str}).");
-        return (plain.clone(), plain);
+    Loaded {
+        days: ics::expand(&all, from, days),
+        failed,
+        total: state.config.sources.len(),
     }
-
-    let mut plain_lines = vec![format!("📅 {day_str}")];
-    let mut html_lines = vec![format!("📅 <strong>{day_str}</strong>")];
-
-    for ev in events {
-        let time_str = match &ev.time {
-            EventTime::AllDay => "All day".to_owned(),
-            EventTime::At(dt) => dt.format("%H:%M").to_string(),
-        };
-        let loc_plain = ev
-            .location
-            .as_deref()
-            .map(|l| format!(" [{l}]"))
-            .unwrap_or_default();
-        let loc_html = ev
-            .location
-            .as_deref()
-            .map(|l| format!(" <em>[{}]</em>", html_escape(l)))
-            .unwrap_or_default();
-        plain_lines.push(format!("• {} {}{}", time_str, ev.summary, loc_plain));
-        html_lines.push(format!(
-            "• {} {}{}",
-            time_str,
-            html_escape(&ev.summary),
-            loc_html
-        ));
-    }
-
-    (plain_lines.join("\n"), html_lines.join("<br>"))
-}
-
-fn format_week_message(
-    week_start: NaiveDate,
-    week_days: &[(NaiveDate, Vec<DayEvent>)],
-) -> (String, String) {
-    let week_end = week_start + Duration::days(6);
-    let header = format!(
-        "📆 {} – {}",
-        week_start.format("%a %d %b"),
-        week_end.format("%a %d %b %Y"),
-    );
-
-    let has_events = week_days.iter().any(|(_, evs)| !evs.is_empty());
-    if !has_events {
-        let plain = format!("{header}: no events.");
-        return (plain.clone(), plain);
-    }
-
-    let mut plain_lines = vec![format!("{header}")];
-    let mut html_lines = vec![format!("<strong>{header}</strong>")];
-
-    for (day, events) in week_days {
-        if events.is_empty() {
-            continue;
-        }
-        let day_prefix = day.format("%a %d").to_string();
-        for ev in events {
-            let time_str = match &ev.time {
-                EventTime::AllDay => "All day".to_owned(),
-                EventTime::At(dt) => dt.format("%H:%M").to_string(),
-            };
-            let loc_plain = ev
-                .location
-                .as_deref()
-                .map(|l| format!(" [{l}]"))
-                .unwrap_or_default();
-            let loc_html = ev
-                .location
-                .as_deref()
-                .map(|l| format!(" <em>[{}]</em>", html_escape(l)))
-                .unwrap_or_default();
-            plain_lines.push(format!(
-                "{day_prefix} · {} {}{}",
-                time_str, ev.summary, loc_plain
-            ));
-            html_lines.push(format!(
-                "<strong>{day_prefix}</strong> · {} {}{}",
-                time_str,
-                html_escape(&ev.summary),
-                loc_html,
-            ));
-        }
-    }
-
-    (plain_lines.join("\n"), html_lines.join("<br>"))
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
 
-async fn check_and_post(state: &BotState, post_if_empty: bool) {
-    let today = Local::now().date_naive();
-    let events = get_todays_events(&state.http, &state.config, today).await;
-
-    if events.is_empty() && !post_if_empty {
-        info!("No events today — staying silent");
+/// Post a scheduled overview, unless it would be empty and `post_if_empty`
+/// is off. When no calendar could be reached, nothing is posted: "no events"
+/// would be a claim we can't make.
+async fn post_scheduled(
+    state: &BotState,
+    what: &str,
+    loaded: &Loaded,
+    post_if_empty: bool,
+    message: impl FnOnce() -> render::Message,
+) {
+    if loaded.all_failed() {
+        error!("Skipping {what}: no calendar source could be loaded");
         return;
     }
+    let count = loaded.event_count();
+    if count == 0 && !post_if_empty {
+        info!("No events for the {what} — staying silent");
+        return;
+    }
+    let (plain, html) = message();
+    info!("Posting {what} ({count} event(s)) to Matrix");
+    state.broadcast(what, &plain, &html).await;
+}
 
-    let (plain, html) = format_today_message(today, &events);
-    info!(
-        "Posting daily summary ({} event(s)) to Matrix",
-        events.len()
-    );
-    state.broadcast("daily summary", &plain, &html).await;
+async fn check_and_post(state: &BotState, post_if_empty: bool) {
+    let today = Local::now().date_naive();
+    let loaded = load(state, today, 1).await;
+    post_scheduled(state, "daily summary", &loaded, post_if_empty, || {
+        render::day_message(today, today, &loaded.days[0].1, loaded.failed, loaded.total)
+    })
+    .await;
 }
 
 /// The next time `time` occurs strictly after `now` (today or tomorrow).
@@ -947,18 +630,18 @@ async fn daily_scheduler_loop(state: BotState, test_mode: bool) {
 }
 
 async fn check_and_post_weekly(state: &BotState, post_if_empty: bool) {
-    let week_start = Local::now().date_naive();
-    let week_days = get_week_events(&state.http, &state.config, week_start).await;
-    let total: usize = week_days.iter().map(|(_, evs)| evs.len()).sum();
-
-    if total == 0 && !post_if_empty {
-        info!("No events this week — staying silent");
-        return;
-    }
-
-    let (plain, html) = format_week_message(week_start, &week_days);
-    info!("Posting weekly summary ({total} event(s)) to Matrix");
-    state.broadcast("weekly summary", &plain, &html).await;
+    let today = Local::now().date_naive();
+    let loaded = load(state, today, 7).await;
+    post_scheduled(state, "weekly summary", &loaded, post_if_empty, || {
+        render::range_message(
+            &render::week_title(today),
+            &loaded.days,
+            today,
+            loaded.failed,
+            loaded.total,
+        )
+    })
+    .await;
 }
 
 async fn weekly_scheduler_loop(state: BotState, test_mode: bool) {
@@ -999,105 +682,96 @@ async fn weekly_scheduler_loop(state: BotState, test_mode: bool) {
     }
 }
 
-/// Returns events grouped by day for the full calendar month containing `month_start`.
-async fn get_month_events(
-    http: &reqwest::Client,
-    config: &CalendarConfig,
-    month_start: NaiveDate,
-) -> Vec<(NaiveDate, Vec<DayEvent>)> {
-    let first = NaiveDate::from_ymd_opt(month_start.year(), month_start.month(), 1).unwrap();
-    let next_month_first = if first.month() == 12 {
-        NaiveDate::from_ymd_opt(first.year() + 1, 1, 1).unwrap()
+/// First day of `day`'s month, and how many days remain in it from `day`.
+fn rest_of_month(day: NaiveDate) -> (NaiveDate, i64) {
+    let first = NaiveDate::from_ymd_opt(day.year(), day.month(), 1).expect("valid month");
+    let next = if day.month() == 12 {
+        NaiveDate::from_ymd_opt(day.year() + 1, 1, 1)
     } else {
-        NaiveDate::from_ymd_opt(first.year(), first.month() + 1, 1).unwrap()
-    };
-    let days_in_month = (next_month_first - first).num_days();
-
-    let mut all: Vec<IcsEvent> = Vec::new();
-    for (i, src) in config.sources.iter().enumerate() {
-        match fetch_source_ics_events(http, src, first, next_month_first).await {
-            Ok(events) => {
-                info!("Monthly source {}: {} raw event(s)", i + 1, events.len());
-                all.extend(events);
-            }
-            Err(e) => warn!("Monthly source {} failed: {e}", i + 1),
-        }
+        NaiveDate::from_ymd_opt(day.year(), day.month() + 1, 1)
     }
-
-    (0..days_in_month)
-        .map(|d| {
-            let day = first + Duration::days(d);
-            let mut events = events_for_today(&all, day);
-            events.sort_by_key(|e| e.sort_key());
-            (day, events)
-        })
-        .collect()
-}
-
-fn format_month_message(
-    month_start: NaiveDate,
-    month_days: &[(NaiveDate, Vec<DayEvent>)],
-) -> (String, String) {
-    let header = format!("📅 {}", month_start.format("%B %Y"));
-
-    let has_events = month_days.iter().any(|(_, evs)| !evs.is_empty());
-    if !has_events {
-        let plain = format!("{header}: no events.");
-        return (plain.clone(), plain);
-    }
-
-    let mut plain_lines = vec![format!("{header}")];
-    let mut html_lines = vec![format!("<strong>{header}</strong>")];
-
-    for (day, events) in month_days {
-        if events.is_empty() {
-            continue;
-        }
-        let day_prefix = day.format("%a %d").to_string();
-        for ev in events {
-            let time_str = match &ev.time {
-                EventTime::AllDay => "All day".to_owned(),
-                EventTime::At(dt) => dt.format("%H:%M").to_string(),
-            };
-            let loc_plain = ev
-                .location
-                .as_deref()
-                .map(|l| format!(" [{l}]"))
-                .unwrap_or_default();
-            let loc_html = ev
-                .location
-                .as_deref()
-                .map(|l| format!(" <em>[{}]</em>", html_escape(l)))
-                .unwrap_or_default();
-            plain_lines.push(format!(
-                "{day_prefix} · {} {}{}",
-                time_str, ev.summary, loc_plain
-            ));
-            html_lines.push(format!(
-                "<strong>{day_prefix}</strong> · {} {}{}",
-                time_str,
-                html_escape(&ev.summary),
-                loc_html,
-            ));
-        }
-    }
-
-    (plain_lines.join("\n"), html_lines.join("<br>"))
+    .expect("valid month");
+    (first, (next - day).num_days())
 }
 
 async fn check_and_post_monthly(state: &BotState, post_if_empty: bool) {
+    // From today to the end of the month: days already past are no use in
+    // an overview (and on the default day 1 this is the whole month).
     let today = Local::now().date_naive();
-    let month_days = get_month_events(&state.http, &state.config, today).await;
-    let total: usize = month_days.iter().map(|(_, evs)| evs.len()).sum();
+    let (first, days) = rest_of_month(today);
+    let loaded = load(state, today, days).await;
+    post_scheduled(state, "monthly summary", &loaded, post_if_empty, || {
+        render::range_message(
+            &render::month_title(first),
+            &loaded.days,
+            today,
+            loaded.failed,
+            loaded.total,
+        )
+    })
+    .await;
+}
 
-    if total == 0 && !post_if_empty {
-        info!("No events this month — staying silent");
-        return;
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+/// How far `!next` looks ahead.
+const NEXT_LOOKAHEAD_DAYS: i64 = 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Today,
+    Week,
+    Month,
+    Next,
+    Help,
+}
+
+fn parse_command(body: &str) -> Option<Command> {
+    let word = body.split_whitespace().next()?.to_ascii_lowercase();
+    Some(match word.as_str() {
+        "!today" => Command::Today,
+        "!week" => Command::Week,
+        "!month" => Command::Month,
+        "!next" => Command::Next,
+        "!calendar" | "!cal" => Command::Help,
+        _ => return None,
+    })
+}
+
+async fn command_reply(state: &BotState, command: Command) -> render::Message {
+    let now = Local::now().naive_local();
+    let today = now.date();
+    let (from, days) = match command {
+        Command::Help => return render::help_message(),
+        Command::Today => (today, 1),
+        Command::Week => (today, 7),
+        Command::Month => (today, rest_of_month(today).1),
+        Command::Next => (today, NEXT_LOOKAHEAD_DAYS),
+    };
+    let loaded = load(state, from, days).await;
+    if loaded.all_failed() {
+        return render::unavailable_message();
     }
-
-    let (plain, html) = format_month_message(today, &month_days);
-    info!("Posting monthly summary ({total} event(s)) to Matrix");
-    state.broadcast("monthly summary", &plain, &html).await;
+    let (failed, total) = (loaded.failed, loaded.total);
+    match command {
+        Command::Today => render::day_message(today, today, &loaded.days[0].1, failed, total),
+        Command::Week => render::range_message(
+            &render::week_title(today),
+            &loaded.days,
+            today,
+            failed,
+            total,
+        ),
+        Command::Month => render::range_message(
+            &render::month_title(rest_of_month(today).0),
+            &loaded.days,
+            today,
+            failed,
+            total,
+        ),
+        Command::Next => render::next_message(&loaded.days, now, failed, total),
+        Command::Help => unreachable!("answered above"),
+    }
 }
 
 async fn monthly_scheduler_loop(state: BotState, test_mode: bool) {
@@ -1138,7 +812,8 @@ async fn monthly_scheduler_loop(state: BotState, test_mode: bool) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 const ADMIN_HELP: &str = "Runtime settings (!admin settings): daily_*, weekly_*, monthly_* \
-enabled / time / day / post_if_empty";
+enabled / time / day / post_if_empty\n\
+Everyone: !today · !week · !month · !next · !calendar";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1166,15 +841,18 @@ async fn main() -> Result<()> {
         .start(&config.matrix, &config.security)
         .await?;
 
-    // In-room messages: only the shared admin console applies here.
-    install_message_handler(&bot);
-
     let state = BotState {
         bot: bot.clone(),
-        http: reqwest::Client::new(),
+        http: reqwest::Client::builder()
+            .user_agent(concat!("calendar-bot/", env!("CARGO_PKG_VERSION")))
+            // A hung calendar server must not stall a summary indefinitely.
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?,
         config: config.calendar,
         schedule,
     };
+
+    install_message_handler(&state);
 
     tokio::spawn(daily_scheduler_loop(state.clone(), test_mode));
     tokio::spawn(weekly_scheduler_loop(state.clone(), test_mode));
@@ -1185,16 +863,37 @@ async fn main() -> Result<()> {
     bot.run().await
 }
 
-fn install_message_handler(bot: &Bot) {
-    let admin = bot.admin.clone();
-    bot.client.add_event_handler(
+fn install_message_handler(state: &BotState) {
+    let state = state.clone();
+    state.bot.client.clone().add_event_handler(
         move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
-            let admin = admin.clone();
+            let state = state.clone();
             async move {
-                if room.state() != RoomState::Joined {
+                if room.state() != RoomState::Joined || ev.sender == state.bot.user_id {
                     return;
                 }
-                admin.handle(&room, &ev, encryption.as_ref()).await;
+                if state
+                    .bot
+                    .admin
+                    .handle(&room, &ev, encryption.as_ref())
+                    .await
+                    == mxbot_common::admin::Dispatch::Handled
+                {
+                    return;
+                }
+                let MessageType::Text(text) = &ev.content.msgtype else {
+                    return;
+                };
+                let Some(command) = parse_command(&text.body) else {
+                    return;
+                };
+                let (plain, html) = command_reply(&state, command).await;
+                if let Err(e) = room
+                    .send(RoomMessageEventContent::text_html(plain, html))
+                    .await
+                {
+                    error!("Failed to answer {command:?}: {e}");
+                }
             }
         },
     );
@@ -1273,75 +972,48 @@ mod tests {
     }
 
     #[test]
-    fn rrule_handles_weekly_monthly_byday_and_until() {
-        let start = date(2026, 1, 5); // Monday
-        assert!(rrule_matches(start, "FREQ=WEEKLY", date(2026, 9, 28)));
-        assert!(!rrule_matches(start, "FREQ=WEEKLY", date(2026, 9, 29)));
-        assert!(rrule_matches(
-            start,
-            "FREQ=WEEKLY;BYDAY=MO,WE",
-            date(2026, 9, 30)
-        ));
-        // Third Thursday and last Friday of September 2026.
-        assert!(rrule_matches(
-            start,
-            "FREQ=MONTHLY;BYDAY=3TH",
-            date(2026, 9, 17)
-        ));
-        assert!(rrule_matches(
-            start,
-            "FREQ=MONTHLY;BYDAY=-1FR",
-            date(2026, 9, 25)
-        ));
-        assert!(!rrule_matches(
-            start,
-            "FREQ=MONTHLY;BYDAY=-1FR",
-            date(2026, 9, 18)
-        ));
-        assert!(!rrule_matches(
-            start,
-            "FREQ=DAILY;UNTIL=20260301",
-            date(2026, 3, 2)
-        ));
-        assert!(!rrule_matches(
-            date(2026, 10, 1),
-            "FREQ=DAILY",
-            date(2026, 9, 30)
-        ));
-    }
-
-    #[test]
     fn ics_events_are_parsed_filtered_and_sorted() {
         let ics = "BEGIN:VCALENDAR\r\n\
-            BEGIN:VEVENT\r\nSUMMARY:Plenum\\, groß\r\nDTSTART:20260925T190000\r\nLOCATION:Kü\r\n che\r\nEND:VEVENT\r\n\
-            BEGIN:VEVENT\r\nSUMMARY:Holiday\r\nDTSTART;VALUE=DATE:20260925\r\nEND:VEVENT\r\n\
-            BEGIN:VEVENT\r\nSUMMARY:Standup\r\nDTSTART:20260901T090000\r\nRRULE:FREQ=DAILY\r\nEXDATE:20260925T090000\r\nEND:VEVENT\r\n\
-            BEGIN:VEVENT\r\nSUMMARY:Breakfast\r\nDTSTART:20260925T080000\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:1\r\nSUMMARY:Plenum\\, groß\r\nDTSTART:20260925T190000\r\nLOCATION:Kü\r\n che\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:2\r\nSUMMARY:Holiday\r\nDTSTART;VALUE=DATE:20260925\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:3\r\nSUMMARY:Standup\r\nDTSTART:20260901T090000\r\nRRULE:FREQ=DAILY\r\nEXDATE:20260925T090000\r\nEND:VEVENT\r\n\
+            BEGIN:VEVENT\r\nUID:4\r\nSUMMARY:Breakfast\r\nDTSTART:20260925T080000\r\nEND:VEVENT\r\n\
             END:VCALENDAR\r\n";
-        let events = parse_ics(ics);
+        let events = ics::parse_ics(ics);
         assert_eq!(events.len(), 4);
         assert_eq!(events[0].summary, "Plenum, groß");
         assert_eq!(events[0].location.as_deref(), Some("Küche"));
 
-        let today = events_for_today(&events, date(2026, 9, 25));
-        let summaries: Vec<&str> = today.iter().map(|e| e.summary.as_str()).collect();
-        // Timed events by time, all-day last; the excluded recurrence is gone.
-        assert_eq!(summaries, ["Breakfast", "Plenum, groß", "Holiday"]);
+        let days = ics::expand(&events, date(2026, 9, 25), 1);
+        let summaries: Vec<&str> = days[0].1.iter().map(|e| e.summary.as_str()).collect();
+        // All-day first, then timed by time; the excluded recurrence is gone.
+        assert_eq!(summaries, ["Holiday", "Breakfast", "Plenum, groß"]);
     }
 
     #[test]
-    fn today_message_escapes_html_and_handles_empty_days() {
-        let (plain, _) = format_today_message(date(2026, 9, 25), &[]);
-        assert!(plain.starts_with("📅 No events today"));
+    fn caldav_xml_escaping_is_undone() {
+        assert_eq!(
+            xml_unescape("SUMMARY:Tom &amp; Jerry &lt;3&#13;\nLOCATION:&#x4B;üche"),
+            "SUMMARY:Tom & Jerry <3\r\nLOCATION:Küche"
+        );
+        assert_eq!(xml_unescape("a & b; c"), "a & b; c");
+    }
 
-        let events = [DayEvent {
-            time: EventTime::AllDay,
-            summary: "<b>Party</b>".into(),
-            location: Some("A & B".into()),
-        }];
-        let (plain, html) = format_today_message(date(2026, 9, 25), &events);
-        assert!(plain.contains("• All day <b>Party</b> [A & B]"));
-        assert!(html.contains("&lt;b&gt;Party&lt;/b&gt; <em>[A &amp; B]</em>"));
+    #[test]
+    fn commands_are_recognised() {
+        assert_eq!(parse_command("!today"), Some(Command::Today));
+        assert_eq!(parse_command("  !WEEK please"), Some(Command::Week));
+        assert_eq!(parse_command("!cal"), Some(Command::Help));
+        assert_eq!(parse_command("!next"), Some(Command::Next));
+        assert_eq!(parse_command("today"), None);
+        assert_eq!(parse_command("!todayish"), None);
+    }
+
+    #[test]
+    fn rest_of_month_counts_from_today() {
+        assert_eq!(rest_of_month(date(2026, 9, 1)), (date(2026, 9, 1), 30));
+        assert_eq!(rest_of_month(date(2026, 9, 25)), (date(2026, 9, 1), 6));
+        assert_eq!(rest_of_month(date(2026, 12, 31)), (date(2026, 12, 1), 1));
     }
 
     #[test]
