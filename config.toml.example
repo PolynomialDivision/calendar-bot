@@ -6,21 +6,21 @@
 # or `!admin set weekly_enabled true` (see `!admin settings`). Changes are
 # persisted in store/settings.json; `!admin unset <key>` reverts to this file.
 
-# Daily summary — posted every day at the configured time.
+# Daily summary: posted every day at the configured time.
 # enabled defaults to true, so omitting this section keeps the daily reminder on.
 [calendar.daily]
 enabled = true
 time = "07:00"          # 24h HH:MM
 post_if_empty = false   # set true to post even when there are no events
 
-# Weekly overview — posted at the start of the configured weekday.
+# Weekly overview: posted at the start of the configured weekday.
 [calendar.weekly]
 enabled = false
 day = "monday"          # monday, tuesday, wednesday, thursday, friday, saturday, sunday
 time = "07:00"
 post_if_empty = false
 
-# Monthly overview — posted on the configured day of each month.
+# Monthly overview: posted on the configured day of each month.
 [calendar.monthly]
 enabled = false
 day = 1                 # day of month (1–31; clamped to last day for short months)
@@ -66,14 +66,14 @@ device_id = "YOUR_DEVICE_ID"
 # Configured admins may always open a direct chat with the bot.
 allowed_inviters = ["@you:matrix.org"]
 
-# Users allowed to run admin commands — in shared rooms and privately in a
+# Users allowed to run admin commands, privately in a
 # direct chat with the bot (send !admin there for help).
 admin_users = ["@you:matrix.org"]
 
 # Which devices receive room keys:
-#   identity_based  — only cross-signed devices (default, recommended)
-#   only_trusted    — only explicitly verified devices
-#   all_devices     — all devices, no restriction
+#   identity_based: only cross-signed devices (default, recommended)
+#   only_trusted: only explicitly verified devices
+#   all_devices: all devices, no restriction
 encryption_strategy = "identity_based"
 
 [security.verification]

@@ -7,6 +7,7 @@ use crate::ics::{DayEntry, EntryTime};
 
 const MAX_TITLE_CHARS: usize = 120;
 const MAX_LOCATION_CHARS: usize = 40;
+const NOTHING: &str = "🌴 Nothing on the calendar.";
 
 /// Plain text and HTML of one message.
 pub type Message = (String, String);
@@ -99,7 +100,7 @@ fn entry_line(entry: &DayEntry, when: &str, suffix: Option<String>) -> Message {
 fn warning_line(failed: usize, total: usize) -> Option<String> {
     (failed > 0).then(|| {
         format!(
-            "⚠️ {failed} of {total} calendar{} could not be loaded — this may be incomplete.",
+            "⚠️ {failed} of {total} calendar{} could not be loaded. This may be incomplete.",
             if total == 1 { "" } else { "s" }
         )
     })
@@ -126,11 +127,10 @@ pub fn day_message(
     let mut plain = Vec::new();
     let mut html = Vec::new();
     if entries.is_empty() {
-        plain.push(format!("📅 {title} — nothing on the calendar."));
-        html.push(format!(
-            "📅 <strong>{}</strong> — nothing on the calendar.",
-            html_escape(&title)
-        ));
+        plain.push(format!("📅 {title}"));
+        plain.push(NOTHING.to_owned());
+        html.push(format!("📅 <strong>{}</strong>", html_escape(&title)));
+        html.push(NOTHING.to_owned());
     } else {
         plain.push(format!("📅 {title}"));
         html.push(format!("📅 <strong>{}</strong>", html_escape(&title)));
@@ -175,9 +175,14 @@ pub fn range_message(
             continue;
         }
         any = true;
+        // A blank line between days keeps a long week readable on a phone.
+        if !plain.is_empty() {
+            plain.push(String::new());
+            html.push(String::new());
+        }
         let heading = day_heading(*day, today);
-        plain.push(heading.clone());
-        html.push(format!("<strong>{}</strong>", html_escape(&heading)));
+        plain.push(format!("🔹 {heading}"));
+        html.push(format!("🔹 <strong>{}</strong>", html_escape(&heading)));
         for entry in shown {
             let when = match entry.time {
                 EntryTime::AllDay => "All day".to_owned(),
@@ -206,11 +211,10 @@ pub fn range_message(
         out_plain.extend(plain);
         out_html.extend(html);
     } else {
-        out_plain.push(format!("{title} — nothing on the calendar."));
-        out_html.push(format!(
-            "<strong>{}</strong> — nothing on the calendar.",
-            html_escape(title)
-        ));
+        out_plain.push(title.to_owned());
+        out_plain.push(NOTHING.to_owned());
+        out_html.push(format!("<strong>{}</strong>", html_escape(title)));
+        out_html.push(NOTHING.to_owned());
     }
     if let Some(w) = warning_line(failed, total) {
         out_plain.push(w.clone());
@@ -222,7 +226,7 @@ pub fn range_message(
 pub fn week_title(start: NaiveDate) -> String {
     let end = start + Duration::days(6);
     format!(
-        "📆 Next 7 days · {} – {}",
+        "📆 Next 7 days · {} to {}",
         start.format("%-d %b"),
         end.format("%-d %b")
     )
@@ -253,7 +257,7 @@ pub fn next_message(
     let (mut plain, mut html) = match next {
         None => {
             let text = format!(
-                "⏭️ Nothing on the calendar in the next {} days.",
+                "⏭️ Nothing on the calendar in the next {} days. 🌴",
                 days.len()
             );
             (vec![text.clone()], vec![text])
@@ -293,17 +297,17 @@ pub fn next_message(
 
 pub fn help_message() -> Message {
     let plain = "📅 Calendar\n\
-                 !today — today's events\n\
-                 !week — the next 7 days\n\
-                 !month — the rest of this month\n\
-                 !next — the next event"
+                 ☀️ !today: today's events\n\
+                 📆 !week: the next 7 days\n\
+                 🗓️ !month: the rest of this month\n\
+                 ⏭️ !next: the next event"
         .to_owned();
     let html = plain.replace('\n', "<br>");
     (plain, html)
 }
 
 pub fn unavailable_message() -> Message {
-    let text = "⚠️ The calendar could not be reached right now — try again later.".to_owned();
+    let text = "⚠️ I can't reach the calendar right now.\n🔁 Please try again later.".to_owned();
     (text.clone(), text)
 }
 
@@ -364,12 +368,10 @@ mod tests {
     fn empty_and_partially_failed_states_are_honest() {
         let today = date(2026, 9, 25);
         let (plain, _) = day_message(today, today, &[], 0, 1);
-        assert_eq!(plain, "📅 Today · Fri 25 Sep — nothing on the calendar.");
+        assert_eq!(plain, "📅 Today · Fri 25 Sep\n🌴 Nothing on the calendar.");
 
         let (plain, _) = day_message(today, today, &[], 1, 3);
-        assert!(
-            plain.ends_with("⚠️ 1 of 3 calendars could not be loaded — this may be incomplete.")
-        );
+        assert!(plain.ends_with("⚠️ 1 of 3 calendars could not be loaded. This may be incomplete."));
     }
 
     #[test]
@@ -392,7 +394,7 @@ mod tests {
         ];
         let (week, _) = range_message("📆 Week", &days, date(2026, 9, 25), 0, 1);
         assert_eq!(
-            week, "📆 Week\nFri 25 Sep · today\n• All day Trip (until Sun 27 Sep)",
+            week, "📆 Week\n🔹 Fri 25 Sep · today\n• All day Trip (until Sun 27 Sep)",
             "listed once, not on every day"
         );
     }
@@ -416,10 +418,11 @@ mod tests {
 
         assert_eq!(
             plain,
-            "📆 Next 7 days · 25 Sep – 1 Oct\n\
-             Fri 25 Sep · today\n\
+            "📆 Next 7 days · 25 Sep to 1 Oct\n\
+             🔹 Fri 25 Sep · today\n\
              • 19:00 Plenum\n\
-             Sun 27 Sep\n\
+             \n\
+             🔹 Sun 27 Sep\n\
              • 10:00–12:00 Brunch\n\
              • 20:00 <Movie>"
         );

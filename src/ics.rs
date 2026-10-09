@@ -401,7 +401,7 @@ impl Rule {
             return true;
         }
         // The set is a month for MONTHLY (and YEARLY with BYMONTH), a week
-        // for WEEKLY — the common uses.
+        // for WEEKLY (the common uses).
         let period: Vec<NaiveDate> = match self.freq {
             Freq::Weekly => {
                 let monday = d - Duration::days(d.weekday().num_days_from_monday() as i64);
@@ -490,7 +490,7 @@ impl DayEntry {
     fn sort_key(&self, day: NaiveDate) -> (u8, NaiveTime) {
         match self.time {
             // Events already running (all-day, or continuing from earlier
-            // days) frame the day, so they come first — as in calendar apps.
+            // days) frame the day, so they come first, as in calendar apps.
             _ if self.first_day < day => (0, NaiveTime::MIN),
             EntryTime::AllDay => (0, NaiveTime::MIN),
             EntryTime::Timed { start, .. } => (1, start),

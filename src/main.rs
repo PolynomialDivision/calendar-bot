@@ -33,9 +33,9 @@ struct Config {
 struct CalendarSource {
     /// Direct ICS URL (GET request).
     ics_url: Option<String>,
-    /// CalDAV collection URL (REPORT request — server-side date filtering, handles recurrence).
+    /// CalDAV collection URL (REPORT request, server-side date filtering, handles recurrence).
     caldav_url: Option<String>,
-    /// CalDAV account root URL — discovers and fetches all calendars automatically.
+    /// CalDAV account root URL: discovers and fetches all calendars automatically.
     caldav_account_url: Option<String>,
     /// HTTP Basic Auth username (optional).
     username: Option<String>,
@@ -537,7 +537,7 @@ async fn post_scheduled(
     }
     let count = loaded.event_count();
     if count == 0 && !post_if_empty {
-        info!("No events for the {what} — staying silent");
+        info!("No events for the {what}, staying silent");
         return;
     }
     let (plain, html) = message();
@@ -811,9 +811,12 @@ async fn monthly_scheduler_loop(state: BotState, test_mode: bool) {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-const ADMIN_HELP: &str = "Runtime settings (!admin settings): daily_*, weekly_*, monthly_* \
-enabled / time / day / post_if_empty\n\
-Everyone: !today · !week · !month · !next · !calendar";
+const ADMIN_HELP: &str = "⚙️ Settings (!admin settings):\n\
+daily_*, weekly_*, monthly_*\n\
+with enabled, time, day, post_if_empty\n\
+\n\
+👥 For everyone:\n\
+!today · !week · !month · !next · !calendar";
 
 #[tokio::main]
 async fn main() -> Result<()> {
