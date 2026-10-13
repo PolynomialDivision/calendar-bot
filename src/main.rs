@@ -3,6 +3,11 @@ mod render;
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+
 use mxbot_common::{
     config::{MatrixConfig, SecurityConfig, TimeOfDay},
     matrix_sdk::{
@@ -12,6 +17,7 @@ use mxbot_common::{
         },
         Room, RoomState,
     },
+    persist,
     settings::Settings,
     Bot,
 };
@@ -210,6 +216,76 @@ struct BotState {
     http: reqwest::Client,
     config: CalendarConfig,
     schedule: Settings<Schedule>,
+    posted: PostedStore,
+}
+
+// ── Posted markers ────────────────────────────────────────────────────────────
+
+/// The scheduled run each summary last handled, as the date of that run,
+/// persisted in `store/posted.json`. Without it a restart around the
+/// scheduled minute would lose the post for good: the fresh process only
+/// looks ahead to the next run.
+#[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Posted {
+    daily: Option<NaiveDate>,
+    weekly: Option<NaiveDate>,
+    monthly: Option<NaiveDate>,
+}
+
+impl Posted {
+    fn get(&self, kind: Summary) -> Option<NaiveDate> {
+        match kind {
+            Summary::Daily => self.daily,
+            Summary::Weekly => self.weekly,
+            Summary::Monthly => self.monthly,
+        }
+    }
+
+    fn set(&mut self, kind: Summary, date: NaiveDate) {
+        let slot = match kind {
+            Summary::Daily => &mut self.daily,
+            Summary::Weekly => &mut self.weekly,
+            Summary::Monthly => &mut self.monthly,
+        };
+        *slot = Some(date);
+    }
+}
+
+#[derive(Clone)]
+struct PostedStore {
+    path: PathBuf,
+    inner: Arc<Mutex<Posted>>,
+}
+
+impl PostedStore {
+    async fn load(path: PathBuf) -> Result<Self> {
+        let posted: Posted = persist::load_json_or_default(&path).await?;
+        Ok(Self {
+            path,
+            inner: Arc::new(Mutex::new(posted)),
+        })
+    }
+
+    fn get(&self, kind: Summary) -> Option<NaiveDate> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(kind)
+    }
+
+    /// Remember that the run of `kind` dated `date` was handled. A failed
+    /// write only costs a possible repeat after the next restart, so it is
+    /// logged rather than propagated.
+    async fn mark(&self, kind: Summary, date: NaiveDate) {
+        let snapshot = {
+            let mut posted = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            posted.set(kind, date);
+            *posted
+        };
+        if let Err(e) = persist::save_json_atomic(&self.path, &snapshot).await {
+            warn!("Could not save {}: {e:#}", self.path.display());
+        }
+    }
 }
 
 impl BotState {
@@ -225,11 +301,11 @@ impl BotState {
     }
 }
 
-/// Sleep until `target`, or until the schedule settings change (`false`).
-async fn sleep_until_or_changed(secs: u64, changes: &mut watch::Receiver<u64>) -> bool {
+/// Sleep for `secs`, or until the schedule settings change.
+async fn sleep_until_or_changed(secs: u64, changes: &mut watch::Receiver<u64>) {
     tokio::select! {
-        _ = sleep(TokioDuration::from_secs(secs)) => true,
-        _ = changes.changed() => false,
+        _ = sleep(TokioDuration::from_secs(secs)) => {}
+        _ = changes.changed() => {}
     }
 }
 
@@ -523,35 +599,28 @@ async fn load(state: &BotState, from: NaiveDate, days: i64) -> Loaded {
 
 /// Post a scheduled overview, unless it would be empty and `post_if_empty`
 /// is off. When no calendar could be reached, nothing is posted: "no events"
-/// would be a claim we can't make.
+/// would be a claim we can't make. Returns whether the run counts as
+/// handled, which it does not in that last case, so it can be retried.
 async fn post_scheduled(
     state: &BotState,
     what: &str,
     loaded: &Loaded,
     post_if_empty: bool,
     message: impl FnOnce() -> render::Message,
-) {
+) -> bool {
     if loaded.all_failed() {
         error!("Skipping {what}: no calendar source could be loaded");
-        return;
+        return false;
     }
     let count = loaded.event_count();
     if count == 0 && !post_if_empty {
         info!("No events for the {what}, staying silent");
-        return;
+        return true;
     }
     let (plain, html) = message();
     info!("Posting {what} ({count} event(s)) to Matrix");
     state.broadcast(what, &plain, &html).await;
-}
-
-async fn check_and_post(state: &BotState, post_if_empty: bool) {
-    let today = Local::now().date_naive();
-    let loaded = load(state, today, 1).await;
-    post_scheduled(state, "daily summary", &loaded, post_if_empty, || {
-        render::day_message(today, today, &loaded.days[0].1, loaded.failed, loaded.total)
-    })
-    .await;
+    true
 }
 
 /// The next time `time` occurs strictly after `now` (today or tomorrow).
@@ -595,61 +664,194 @@ fn next_monthly_run(now: NaiveDateTime, day: u32, time: NaiveTime) -> NaiveDateT
     date.and_time(time)
 }
 
+/// The most recent day-of-month `day` at `time` that is not after `now`.
+fn last_monthly_run(now: NaiveDateTime, day: u32, time: NaiveTime) -> NaiveDateTime {
+    let today = now.date();
+    let day = day.clamp(1, 31);
+    let candidate = month_day(today.year(), today.month(), day).and_time(time);
+    if candidate <= now {
+        candidate
+    } else if today.month() == 1 {
+        month_day(today.year() - 1, 12, day).and_time(time)
+    } else {
+        month_day(today.year(), today.month() - 1, day).and_time(time)
+    }
+}
+
 fn naive_time(t: TimeOfDay) -> NaiveTime {
     NaiveTime::from_hms_opt(t.hour, t.minute, 0).expect("TimeOfDay is validated")
 }
 
-async fn daily_scheduler_loop(state: BotState, test_mode: bool) {
-    if test_mode {
-        let schedule = state.schedule.get();
-        if schedule.daily_enabled {
-            info!("Test mode: posting daily summary immediately");
-            check_and_post(&state, schedule.daily_post_if_empty).await;
+/// Whole seconds from `now` until `target`, rounded up so a timer never
+/// fires just short of the moment it waits for.
+fn secs_until(now: NaiveDateTime, target: NaiveDateTime) -> u64 {
+    let millis = (target - now).num_milliseconds().max(0);
+    ((millis + 999) / 1000) as u64
+}
+
+/// How long to wait before retrying a run whose calendars were all
+/// unreachable.
+const RETRY_AFTER: Duration = Duration::minutes(15);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Summary {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl Summary {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Daily => "daily summary",
+            Self::Weekly => "weekly summary",
+            Self::Monthly => "monthly summary",
         }
-        return;
     }
 
-    let mut changes = state.schedule.store().subscribe();
-    loop {
-        let schedule = state.schedule.get();
-        if !schedule.daily_enabled {
-            info!("Daily summary disabled");
-            if changes.changed().await.is_err() {
-                return;
-            }
-            continue;
+    fn enabled(self, schedule: &Schedule) -> bool {
+        match self {
+            Self::Daily => schedule.daily_enabled,
+            Self::Weekly => schedule.weekly_enabled,
+            Self::Monthly => schedule.monthly_enabled,
         }
-        let now = Local::now().naive_local();
-        let next_dt = next_daily_run(now, naive_time(schedule.daily_time));
-        let secs = (next_dt - now).num_seconds().max(0) as u64;
-        info!("Next daily summary in {secs}s (at {})", schedule.daily_time);
-        if sleep_until_or_changed(secs, &mut changes).await {
-            check_and_post(&state, schedule.daily_post_if_empty).await;
+    }
+
+    fn post_if_empty(self, schedule: &Schedule) -> bool {
+        match self {
+            Self::Daily => schedule.daily_post_if_empty,
+            Self::Weekly => schedule.weekly_post_if_empty,
+            Self::Monthly => schedule.monthly_post_if_empty,
+        }
+    }
+
+    fn time(self, schedule: &Schedule) -> NaiveTime {
+        naive_time(match self {
+            Self::Daily => schedule.daily_time,
+            Self::Weekly => schedule.weekly_time,
+            Self::Monthly => schedule.monthly_time,
+        })
+    }
+
+    /// The first scheduled run strictly after `now`.
+    fn next_run(self, now: NaiveDateTime, schedule: &Schedule) -> NaiveDateTime {
+        let time = self.time(schedule);
+        match self {
+            Self::Daily => next_daily_run(now, time),
+            Self::Weekly => next_weekly_run(now, parse_weekday(&schedule.weekly_day), time),
+            Self::Monthly => next_monthly_run(now, schedule.monthly_day, time),
+        }
+    }
+
+    /// The most recent scheduled run at or before `now`.
+    fn last_run(self, now: NaiveDateTime, schedule: &Schedule) -> NaiveDateTime {
+        let time = self.time(schedule);
+        match self {
+            Self::Daily => next_daily_run(now, time) - Duration::days(1),
+            Self::Weekly => {
+                next_weekly_run(now, parse_weekday(&schedule.weekly_day), time) - Duration::days(7)
+            }
+            Self::Monthly => last_monthly_run(now, schedule.monthly_day, time),
+        }
+    }
+
+    /// How long after its scheduled moment a missed run is still worth
+    /// posting: half the period. Later than that the overview is mostly
+    /// about days already gone, and the next regular run is closer anyway.
+    fn catch_up_window(self) -> Duration {
+        match self {
+            Self::Daily => Duration::hours(12),
+            Self::Weekly => Duration::hours(84),
+            Self::Monthly => Duration::days(15),
+        }
+    }
+
+    fn describe_run(self, run: NaiveDateTime, schedule: &Schedule) -> String {
+        let time = match self {
+            Self::Daily => schedule.daily_time,
+            Self::Weekly => schedule.weekly_time,
+            Self::Monthly => schedule.monthly_time,
+        };
+        match self {
+            Self::Daily => format!("at {time}"),
+            Self::Weekly => format!("on {} at {time}", run.format("%A %d %b")),
+            Self::Monthly => format!("on {} at {time}", run.format("%d %b %Y")),
         }
     }
 }
 
-async fn check_and_post_weekly(state: &BotState, post_if_empty: bool) {
+/// The scheduled run that is due now: the most recent one, unless it was
+/// already handled (`posted` holds its date) or lies too far back to be
+/// worth catching up on.
+fn due_run(
+    kind: Summary,
+    now: NaiveDateTime,
+    schedule: &Schedule,
+    posted: Option<NaiveDate>,
+) -> Option<NaiveDateTime> {
+    let last = kind.last_run(now, schedule);
+    if posted == Some(last.date()) || now - last > kind.catch_up_window() {
+        return None;
+    }
+    Some(last)
+}
+
+/// Load and post the overview of `kind` as of today; `true` when the run
+/// was handled (posted, or silent on purpose).
+async fn check_and_post(state: &BotState, kind: Summary, post_if_empty: bool) -> bool {
     let today = Local::now().date_naive();
-    let loaded = load(state, today, 7).await;
-    post_scheduled(state, "weekly summary", &loaded, post_if_empty, || {
-        render::range_message(
-            &render::week_title(today),
-            &loaded.days,
-            today,
-            loaded.failed,
-            loaded.total,
-        )
-    })
-    .await;
+    let what = kind.name();
+    match kind {
+        Summary::Daily => {
+            let loaded = load(state, today, 1).await;
+            post_scheduled(state, what, &loaded, post_if_empty, || {
+                render::day_message(today, today, &loaded.days[0].1, loaded.failed, loaded.total)
+            })
+            .await
+        }
+        Summary::Weekly => {
+            let loaded = load(state, today, 7).await;
+            post_scheduled(state, what, &loaded, post_if_empty, || {
+                render::range_message(
+                    &render::week_title(today),
+                    &loaded.days,
+                    today,
+                    loaded.failed,
+                    loaded.total,
+                )
+            })
+            .await
+        }
+        Summary::Monthly => {
+            // From today to the end of the month: days already past are no
+            // use in an overview (and on the default day 1 this is the whole
+            // month).
+            let (first, days) = rest_of_month(today);
+            let loaded = load(state, today, days).await;
+            post_scheduled(state, what, &loaded, post_if_empty, || {
+                render::range_message(
+                    &render::month_title(first),
+                    &loaded.days,
+                    today,
+                    loaded.failed,
+                    loaded.total,
+                )
+            })
+            .await
+        }
+    }
 }
 
-async fn weekly_scheduler_loop(state: BotState, test_mode: bool) {
+/// Post `kind` whenever a run is due: at the scheduled moment, right after
+/// a (re)start that fell into the catch-up window of a run nobody handled,
+/// and again after [`RETRY_AFTER`] when the calendars were unreachable.
+async fn scheduler_loop(state: BotState, kind: Summary, test_mode: bool) {
+    let name = kind.name();
     if test_mode {
         let schedule = state.schedule.get();
-        if schedule.weekly_enabled {
-            info!("Test mode: posting weekly summary immediately");
-            check_and_post_weekly(&state, schedule.weekly_post_if_empty).await;
+        if kind.enabled(&schedule) {
+            info!("Test mode: posting {name} immediately");
+            check_and_post(&state, kind, kind.post_if_empty(&schedule)).await;
         }
         return;
     }
@@ -657,28 +859,53 @@ async fn weekly_scheduler_loop(state: BotState, test_mode: bool) {
     let mut changes = state.schedule.store().subscribe();
     loop {
         let schedule = state.schedule.get();
-        if !schedule.weekly_enabled {
-            info!("Weekly summary disabled");
+        if !kind.enabled(&schedule) {
+            info!("{} disabled", capitalize(name));
             if changes.changed().await.is_err() {
                 return;
             }
             continue;
         }
         let now = Local::now().naive_local();
-        let target_dt = next_weekly_run(
-            now,
-            parse_weekday(&schedule.weekly_day),
-            naive_time(schedule.weekly_time),
-        );
-        let secs = (target_dt - now).num_seconds().max(0) as u64;
-        info!(
-            "Next weekly summary in {secs}s (on {} at {})",
-            target_dt.format("%A %d %b"),
-            schedule.weekly_time
-        );
-        if sleep_until_or_changed(secs, &mut changes).await {
-            check_and_post_weekly(&state, schedule.weekly_post_if_empty).await;
+        let mut wake_at = kind.next_run(now, &schedule);
+        let mut retrying = false;
+        if let Some(due) = due_run(kind, now, &schedule, state.posted.get(kind)) {
+            let late = now - due;
+            if late > Duration::minutes(1) {
+                info!(
+                    "Catching up the {name} scheduled {} ({}h {}m ago)",
+                    kind.describe_run(due, &schedule),
+                    late.num_hours(),
+                    late.num_minutes() % 60
+                );
+            }
+            if check_and_post(&state, kind, kind.post_if_empty(&schedule)).await {
+                state.posted.mark(kind, due.date()).await;
+                continue;
+            }
+            let retry_at = Local::now().naive_local() + RETRY_AFTER;
+            if retry_at < wake_at {
+                warn!("Retrying the {name} in {} min", RETRY_AFTER.num_minutes());
+                wake_at = retry_at;
+                retrying = true;
+            }
         }
+        let secs = secs_until(Local::now().naive_local(), wake_at);
+        if !retrying {
+            info!(
+                "Next {name} in {secs}s ({})",
+                kind.describe_run(wake_at, &schedule)
+            );
+        }
+        sleep_until_or_changed(secs, &mut changes).await;
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -692,24 +919,6 @@ fn rest_of_month(day: NaiveDate) -> (NaiveDate, i64) {
     }
     .expect("valid month");
     (first, (next - day).num_days())
-}
-
-async fn check_and_post_monthly(state: &BotState, post_if_empty: bool) {
-    // From today to the end of the month: days already past are no use in
-    // an overview (and on the default day 1 this is the whole month).
-    let today = Local::now().date_naive();
-    let (first, days) = rest_of_month(today);
-    let loaded = load(state, today, days).await;
-    post_scheduled(state, "monthly summary", &loaded, post_if_empty, || {
-        render::range_message(
-            &render::month_title(first),
-            &loaded.days,
-            today,
-            loaded.failed,
-            loaded.total,
-        )
-    })
-    .await;
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -774,41 +983,6 @@ async fn command_reply(state: &BotState, command: Command) -> render::Message {
     }
 }
 
-async fn monthly_scheduler_loop(state: BotState, test_mode: bool) {
-    if test_mode {
-        let schedule = state.schedule.get();
-        if schedule.monthly_enabled {
-            info!("Test mode: posting monthly summary immediately");
-            check_and_post_monthly(&state, schedule.monthly_post_if_empty).await;
-        }
-        return;
-    }
-
-    let mut changes = state.schedule.store().subscribe();
-    loop {
-        let schedule = state.schedule.get();
-        if !schedule.monthly_enabled {
-            info!("Monthly summary disabled");
-            if changes.changed().await.is_err() {
-                return;
-            }
-            continue;
-        }
-        let now = Local::now().naive_local();
-        let target_dt =
-            next_monthly_run(now, schedule.monthly_day, naive_time(schedule.monthly_time));
-        let secs = (target_dt - now).num_seconds().max(0) as u64;
-        info!(
-            "Next monthly summary in {secs}s (on {} at {})",
-            target_dt.format("%d %b %Y"),
-            schedule.monthly_time
-        );
-        if sleep_until_or_changed(secs, &mut changes).await {
-            check_and_post_monthly(&state, schedule.monthly_post_if_empty).await;
-        }
-    }
-}
-
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 const ADMIN_HELP: &str = "⚙️ Settings (!admin settings):\n\
@@ -853,13 +1027,14 @@ async fn main() -> Result<()> {
             .build()?,
         config: config.calendar,
         schedule,
+        posted: PostedStore::load(store_path.join("posted.json")).await?,
     };
 
     install_message_handler(&state);
 
-    tokio::spawn(daily_scheduler_loop(state.clone(), test_mode));
-    tokio::spawn(weekly_scheduler_loop(state.clone(), test_mode));
-    tokio::spawn(monthly_scheduler_loop(state, test_mode));
+    for kind in [Summary::Daily, Summary::Weekly, Summary::Monthly] {
+        tokio::spawn(scheduler_loop(state.clone(), kind, test_mode));
+    }
 
     info!("Starting sync...");
     bot.initial_sync().await;
@@ -1017,6 +1192,154 @@ mod tests {
         assert_eq!(rest_of_month(date(2026, 9, 1)), (date(2026, 9, 1), 30));
         assert_eq!(rest_of_month(date(2026, 9, 25)), (date(2026, 9, 1), 6));
         assert_eq!(rest_of_month(date(2026, 12, 31)), (date(2026, 12, 1), 1));
+    }
+
+    fn schedule(day: &str, time: TimeOfDay) -> Schedule {
+        Schedule {
+            daily_enabled: true,
+            daily_time: time,
+            daily_post_if_empty: false,
+            weekly_enabled: true,
+            weekly_day: day.to_owned(),
+            weekly_time: time,
+            weekly_post_if_empty: false,
+            monthly_enabled: true,
+            monthly_day: 1,
+            monthly_time: time,
+            monthly_post_if_empty: false,
+        }
+    }
+
+    #[test]
+    fn last_run_is_the_most_recent_scheduled_moment() {
+        let s = schedule("monday", TimeOfDay::new(7, 0));
+        // Monday 12 Oct 2026, before and after 07:00.
+        let before = at(2026, 10, 12, 6, 59);
+        let after = at(2026, 10, 12, 11, 55);
+        assert_eq!(Summary::Daily.last_run(before, &s), at(2026, 10, 11, 7, 0));
+        assert_eq!(Summary::Daily.last_run(after, &s), at(2026, 10, 12, 7, 0));
+        assert_eq!(Summary::Weekly.last_run(before, &s), at(2026, 10, 5, 7, 0));
+        assert_eq!(Summary::Weekly.last_run(after, &s), at(2026, 10, 12, 7, 0));
+        assert_eq!(Summary::Monthly.last_run(after, &s), at(2026, 10, 1, 7, 0));
+        // Exactly on time counts as this run, not the previous one.
+        assert_eq!(
+            Summary::Daily.last_run(at(2026, 10, 12, 7, 0), &s),
+            at(2026, 10, 12, 7, 0)
+        );
+    }
+
+    #[test]
+    fn last_monthly_run_crosses_months_and_years() {
+        assert_eq!(
+            last_monthly_run(at(2026, 1, 1, 6, 0), 1, hm(7, 0)),
+            at(2025, 12, 1, 7, 0)
+        );
+        assert_eq!(
+            last_monthly_run(at(2026, 3, 10, 6, 0), 31, hm(7, 0)),
+            at(2026, 2, 28, 7, 0)
+        );
+        assert_eq!(
+            last_monthly_run(at(2026, 3, 31, 7, 0), 31, hm(7, 0)),
+            at(2026, 3, 31, 7, 0)
+        );
+    }
+
+    #[test]
+    fn due_run_catches_up_a_missed_post_while_it_is_still_useful() {
+        let s = schedule("monday", TimeOfDay::new(7, 0));
+        let monday_run = at(2026, 10, 12, 7, 0);
+        // Restarted at 11:55 on Monday, nothing posted yet: both are due.
+        let restart = at(2026, 10, 12, 11, 55);
+        assert_eq!(due_run(Summary::Daily, restart, &s, None), Some(monday_run));
+        assert_eq!(
+            due_run(Summary::Weekly, restart, &s, None),
+            Some(monday_run)
+        );
+        // Already handled today: nothing to do.
+        let today = date(2026, 10, 12);
+        assert_eq!(due_run(Summary::Daily, restart, &s, Some(today)), None);
+        assert_eq!(due_run(Summary::Weekly, restart, &s, Some(today)), None);
+        // Last week's marker does not cover this week.
+        let last_week = date(2026, 10, 5);
+        assert_eq!(
+            due_run(Summary::Weekly, restart, &s, Some(last_week)),
+            Some(monday_run)
+        );
+        // Too late: a day overview at 19:30 is history, the week one on
+        // Thursday evening too, but Thursday noon still makes it.
+        assert_eq!(
+            due_run(Summary::Daily, at(2026, 10, 12, 19, 30), &s, None),
+            None
+        );
+        assert_eq!(
+            due_run(Summary::Weekly, at(2026, 10, 15, 19, 30), &s, None),
+            None
+        );
+        assert_eq!(
+            due_run(Summary::Weekly, at(2026, 10, 15, 12, 0), &s, None),
+            Some(monday_run)
+        );
+        // The regular moment itself is due as well.
+        assert_eq!(
+            due_run(Summary::Daily, monday_run, &s, None),
+            Some(monday_run)
+        );
+    }
+
+    #[test]
+    fn next_run_is_always_after_last_run_by_one_period() {
+        let s = schedule("friday", TimeOfDay::new(18, 30));
+        let now = at(2026, 10, 12, 11, 55);
+        assert_eq!(
+            Summary::Weekly.next_run(now, &s) - Summary::Weekly.last_run(now, &s),
+            Duration::days(7)
+        );
+        assert_eq!(
+            Summary::Daily.next_run(now, &s) - Summary::Daily.last_run(now, &s),
+            Duration::days(1)
+        );
+        assert_eq!(Summary::Monthly.next_run(now, &s), at(2026, 11, 1, 18, 30));
+        assert_eq!(Summary::Monthly.last_run(now, &s), at(2026, 10, 1, 18, 30));
+    }
+
+    #[test]
+    fn seconds_until_round_up_and_never_go_negative() {
+        let now = at(2026, 10, 12, 7, 0);
+        assert_eq!(secs_until(now, now), 0);
+        assert_eq!(secs_until(now, now - Duration::seconds(5)), 0);
+        assert_eq!(secs_until(now, now + Duration::milliseconds(1500)), 2);
+        assert_eq!(secs_until(now, now + Duration::seconds(60)), 60);
+    }
+
+    #[tokio::test]
+    async fn posted_markers_survive_a_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "calendar-bot-posted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("posted.json");
+
+        let store = PostedStore::load(path.clone()).await.unwrap();
+        assert_eq!(store.get(Summary::Daily), None);
+        store.mark(Summary::Daily, date(2026, 10, 12)).await;
+        store.mark(Summary::Weekly, date(2026, 10, 12)).await;
+        assert_eq!(store.get(Summary::Weekly), Some(date(2026, 10, 12)));
+        assert_eq!(store.get(Summary::Monthly), None);
+
+        let reloaded = PostedStore::load(path).await.unwrap();
+        assert_eq!(reloaded.get(Summary::Daily), Some(date(2026, 10, 12)));
+        assert_eq!(reloaded.get(Summary::Weekly), Some(date(2026, 10, 12)));
+        assert_eq!(reloaded.get(Summary::Monthly), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn disabled_log_line_keeps_its_old_wording() {
+        assert_eq!(capitalize(Summary::Monthly.name()), "Monthly summary");
     }
 
     #[test]

@@ -5,6 +5,12 @@
 # at runtime in a direct chat with the bot, e.g. `!admin set daily_time 06:30`
 # or `!admin set weekly_enabled true` (see `!admin settings`). Changes are
 # persisted in store/settings.json; `!admin unset <key>` reverts to this file.
+#
+# A post missed because the bot was down or restarting at the scheduled time
+# is caught up right after the start, as long as it is still useful: within
+# 12 hours for the daily, 3.5 days for the weekly and 15 days for the monthly
+# overview. When no calendar can be reached, the post is retried every
+# 15 minutes inside that window. What was handled is kept in store/posted.json.
 
 # Daily summary: posted every day at the configured time.
 # enabled defaults to true, so omitting this section keeps the daily reminder on.
@@ -65,6 +71,11 @@ device_id = "YOUR_DEVICE_ID"
 # Users allowed to invite the bot ("all" = anyone, [] = nobody).
 # Configured admins may always open a direct chat with the bot.
 allowed_inviters = ["@you:matrix.org"]
+# Rooms the bot may join: room IDs, [] for none, or "all" for every room.
+# Required: without it the bot refuses to start.
+allowed_rooms = ["!REPLACE_ME:example.org"]
+# Members of these rooms may also open a private chat with the bot.
+# dm_rooms = ["!REPLACE_ME:example.org"]
 
 # Users allowed to run admin commands, privately in a
 # direct chat with the bot (send !admin there for help).
