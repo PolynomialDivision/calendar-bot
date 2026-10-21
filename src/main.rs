@@ -982,12 +982,40 @@ fn update_wait(
     }
 }
 
+/// The weekly run whose overview is out without a snapshot of it (posted by
+/// a bot from before week updates, or the store lost it), while its week
+/// still runs: then the calendar as it is now becomes its state, and later
+/// changes count. What changed before that is not known.
+fn missing_snapshot(
+    now: NaiveDateTime,
+    schedule: &Schedule,
+    posted: Option<NaiveDate>,
+) -> Option<NaiveDateTime> {
+    let run = Summary::Weekly.last_run(now, schedule);
+    (schedule.weekly_enabled
+        && schedule.weekly_updates
+        && posted == Some(run.date())
+        && now.date() <= run.date() + Duration::days(6))
+    .then_some(run)
+}
+
 /// One check: load the rest of the week (and the weeks after it, to tell
 /// moved from cancelled), compare it with the last overview and post the
 /// rest of the week again when something changed.
 async fn check_week_update(state: &BotState) {
     let now = Local::now().naive_local();
     let Some(before) = state.week.get() else {
+        let posted = state.posted.get(Summary::Weekly);
+        let Some(run) = missing_snapshot(now, &state.schedule.get(), posted) else {
+            return;
+        };
+        let until = run.date() + Duration::days(6);
+        let loaded = load(state, now.date(), (until - now.date()).num_days() + 1).await;
+        if loaded.failed == 0 {
+            info!("Week update: no snapshot of this week's overview, taking the calendar as it is now");
+            let week = update::WeekSnapshot::of(&loaded.days, until, run, true);
+            state.week.set(week).await;
+        }
         return;
     };
     if let Some(why) = update_wait(now, &state.schedule.get(), Some(&before)) {
@@ -1568,6 +1596,36 @@ mod tests {
         assert_eq!(
             update_wait(at(2026, 10, 21, 12, 0), &schedule, Some(&week)),
             Some("off")
+        );
+    }
+
+    #[test]
+    fn a_posted_week_without_a_snapshot_gets_one_while_it_runs() {
+        let mut schedule = schedule("monday", TimeOfDay::new(7, 0));
+        let monday = Some(date(2026, 10, 19));
+        let run = at(2026, 10, 19, 7, 0);
+
+        assert_eq!(
+            missing_snapshot(at(2026, 10, 21, 21, 20), &schedule, monday),
+            Some(run)
+        );
+        assert_eq!(
+            missing_snapshot(at(2026, 10, 25, 23, 0), &schedule, monday),
+            Some(run)
+        );
+        // Not posted (yet), or the week is over: nothing to take.
+        assert_eq!(
+            missing_snapshot(at(2026, 10, 21, 12, 0), &schedule, None),
+            None
+        );
+        assert_eq!(
+            missing_snapshot(at(2026, 10, 26, 6, 0), &schedule, Some(date(2026, 10, 12))),
+            None
+        );
+        schedule.weekly_updates = false;
+        assert_eq!(
+            missing_snapshot(at(2026, 10, 21, 12, 0), &schedule, monday),
+            None
         );
     }
 
