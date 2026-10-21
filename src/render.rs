@@ -1,6 +1,8 @@
 //! Matrix messages for the calendar, laid out for a phone screen: one line
 //! per event, time first, title in bold, days as headings.
 
+use std::collections::HashMap;
+
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 
 use crate::ics::{DayEntry, EntryTime};
@@ -162,10 +164,101 @@ pub fn range_message(
     failed: usize,
     total: usize,
 ) -> Message {
+    let (plain, html) = range_lines(days, today, |_| None);
+    titled(title, plain, html, failed, total)
+}
+
+/// How an event of the week changed since the overview was last posted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mark {
+    New,
+    /// Moved within the week, from this start.
+    Moved(NaiveDateTime),
+}
+
+/// An event of the last overview that is no longer in the rest of the week.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gone {
+    pub summary: String,
+    pub starts_at: NaiveDateTime,
+    pub all_day: bool,
+    /// Its new start when it moved out of the week, `None` when cancelled.
+    pub moved_to: Option<NaiveDateTime>,
+}
+
+/// The rest of the week again after changes: the overview with new and
+/// moved events marked, then what was cancelled or moved away.
+pub fn update_message(
+    days: &[(NaiveDate, Vec<DayEntry>)],
+    today: NaiveDate,
+    marks: &HashMap<String, Mark>,
+    gone: &[Gone],
+    failed: usize,
+    total: usize,
+) -> Message {
+    let (mut plain, mut html) = range_lines(days, today, |entry| marks.get(&entry.key));
+    for (cancelled, heading) in [(true, "❌ Cancelled"), (false, "📅 Moved to another week")] {
+        let listed: Vec<&Gone> = gone
+            .iter()
+            .filter(|g| g.moved_to.is_none() == cancelled)
+            .collect();
+        if listed.is_empty() {
+            continue;
+        }
+        if !plain.is_empty() {
+            plain.push(String::new());
+            html.push(String::new());
+        }
+        plain.push(heading.to_owned());
+        html.push(format!("<strong>{heading}</strong>"));
+        for g in listed {
+            let title = truncate(&g.summary, MAX_TITLE_CHARS);
+            let title = if title.is_empty() {
+                "(no title)".to_owned()
+            } else {
+                title
+            };
+            let was = moment(g.starts_at, g.all_day);
+            let to = g
+                .moved_to
+                .map(|t| format!(" → {}", moment(t, g.all_day)))
+                .unwrap_or_default();
+            plain.push(format!("• {was} {title}{to}"));
+            html.push(format!(
+                "• {was} <strong>{}</strong>{}",
+                html_escape(&title),
+                html_escape(&to)
+            ));
+        }
+    }
+    let last = days.last().map_or(today, |(d, _)| *d);
+    let title = format!(
+        "🔄 Calendar update · {} to {}",
+        today.format("%-d %b"),
+        last.format("%-d %b")
+    );
+    titled(&title, plain, html, failed, total)
+}
+
+/// "Tue 21 Oct 14:00", or without the time for an all-day event.
+fn moment(at: NaiveDateTime, all_day: bool) -> String {
+    if all_day {
+        at.format("%a %-d %b").to_string()
+    } else {
+        at.format("%a %-d %b %H:%M").to_string()
+    }
+}
+
+/// The day headings and bullet lines of a range; `mark` flags single
+/// entries (the update after changes).
+fn range_lines<'a>(
+    days: &[(NaiveDate, Vec<DayEntry>)],
+    today: NaiveDate,
+    mark: impl Fn(&DayEntry) -> Option<&'a Mark>,
+) -> (Vec<String>, Vec<String>) {
     let window_start = days.first().map(|(d, _)| *d);
     let mut plain = vec![];
     let mut html = vec![];
-    let mut any = false;
     for (day, entries) in days {
         let shown: Vec<&DayEntry> = entries
             .iter()
@@ -174,7 +267,6 @@ pub fn range_message(
         if shown.is_empty() {
             continue;
         }
-        any = true;
         // A blank line between days keeps a long week readable on a phone.
         if !plain.is_empty() {
             plain.push(String::new());
@@ -194,15 +286,37 @@ pub fn range_message(
                     _ => start.format("%H:%M").to_string(),
                 },
             };
-            let suffix = entry
+            let mut suffix = entry
                 .is_multi_day()
                 .then(|| format!(" (until {})", entry.last_day.format("%a %-d %b")));
+            let when = match mark(entry) {
+                None => when,
+                Some(Mark::New) => format!("🆕 {when}"),
+                Some(Mark::Moved(from)) => {
+                    let all_day = matches!(entry.time, EntryTime::AllDay);
+                    let was = format!(" (was {})", moment(*from, all_day));
+                    suffix = Some(suffix.unwrap_or_default() + was.as_str());
+                    format!("📅 {when}")
+                }
+            };
             let (p, h) = entry_line(entry, &when, suffix);
             plain.push(p);
             html.push(h);
         }
     }
+    (plain, html)
+}
 
+/// `title` over `plain`/`html` (or "nothing" when they are empty), with the
+/// warning about calendars that failed.
+fn titled(
+    title: &str,
+    plain: Vec<String>,
+    html: Vec<String>,
+    failed: usize,
+    total: usize,
+) -> Message {
+    let any = !plain.is_empty();
     let mut out_plain = vec![];
     let mut out_html = vec![];
     if any {
@@ -332,6 +446,7 @@ mod tests {
             first_day: day,
             last_day: day,
             starts_at: day.and_time(start),
+            key: format!("{title}#{day}"),
         }
     }
 
@@ -343,6 +458,7 @@ mod tests {
             first_day: first,
             last_day: last,
             starts_at: first.and_time(NaiveTime::MIN),
+            key: format!("{title}#{first}"),
         }
     }
 
@@ -454,5 +570,56 @@ mod tests {
         let (plain, _) = day_message(today, today, &[timed(today, hm(9, 0), None, &long)], 0, 1);
         assert!(plain.lines().nth(1).unwrap().chars().count() < 140);
         assert!(plain.contains('…'));
+    }
+
+    #[test]
+    fn update_marks_new_and_moved_events_and_lists_the_gone_ones() {
+        let today = date(2026, 10, 20);
+        let thu = date(2026, 10, 22);
+        let plenum = timed(thu, hm(19, 0), None, "Plenum");
+        let film = timed(thu, hm(21, 0), None, "Film <night>");
+        let days = vec![
+            (today, vec![]),
+            (date(2026, 10, 21), vec![]),
+            (thu, vec![plenum.clone(), film.clone()]),
+        ];
+        let marks = HashMap::from([
+            (
+                plenum.key.clone(),
+                Mark::Moved(date(2026, 10, 21).and_time(hm(19, 0))),
+            ),
+            (film.key.clone(), Mark::New),
+        ]);
+        let gone = [
+            Gone {
+                summary: "Party".to_owned(),
+                starts_at: date(2026, 10, 24).and_time(hm(20, 0)),
+                all_day: false,
+                moved_to: None,
+            },
+            Gone {
+                summary: "Flea market".to_owned(),
+                starts_at: date(2026, 10, 25).and_time(NaiveTime::MIN),
+                all_day: true,
+                moved_to: Some(date(2026, 11, 1).and_time(NaiveTime::MIN)),
+            },
+        ];
+
+        let (plain, html) = update_message(&days, today, &marks, &gone, 0, 1);
+
+        assert_eq!(
+            plain,
+            "🔄 Calendar update · 20 Oct to 22 Oct\n\
+             🔹 Thu 22 Oct\n\
+             • 📅 19:00 Plenum (was Wed 21 Oct 19:00)\n\
+             • 🆕 21:00 Film <night>\n\
+             \n\
+             ❌ Cancelled\n\
+             • Sat 24 Oct 20:00 Party\n\
+             \n\
+             📅 Moved to another week\n\
+             • Sun 25 Oct Flea market → Sun 1 Nov"
+        );
+        assert!(html.contains("<strong>Film &lt;night&gt;</strong>"));
     }
 }

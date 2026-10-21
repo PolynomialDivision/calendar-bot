@@ -25,6 +25,10 @@ enabled = false
 day = "monday"          # monday, tuesday, wednesday, thursday, friday, saturday, sunday
 time = "07:00"
 post_if_empty = false
+# When events of the rest of that week are added, moved or cancelled later,
+# post the rest of the week again with them marked (🆕, 📅, ❌). At most once
+# an hour, not from 22:00 to 07:00, and not while a calendar is unreachable.
+updates = true
 
 # Monthly overview: posted on the configured day of each month.
 [calendar.monthly]

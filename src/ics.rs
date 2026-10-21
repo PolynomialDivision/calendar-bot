@@ -480,6 +480,10 @@ pub struct DayEntry {
     pub last_day: NaiveDate,
     /// Start of the occurrence, for "what's next".
     pub starts_at: NaiveDateTime,
+    /// Which occurrence this is, stable when it is moved: the UID of a single
+    /// event, the UID and original date of one of a series. Without a UID
+    /// the title and start, so such an event can only appear or vanish.
+    pub key: String,
 }
 
 impl DayEntry {
@@ -550,6 +554,12 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
             if !seen.insert(key) {
                 continue;
             }
+            let key = match (ev.uid.as_deref(), &ev.rrule, ev.recurrence_id) {
+                (Some(uid), _, Some(rid)) => format!("{uid}#{rid}"),
+                (Some(uid), Some(_), None) => format!("{uid}#{start_date}"),
+                (Some(uid), None, None) => uid.to_owned(),
+                (None, _, _) => format!("{}#{starts_at}", ev.summary),
+            };
             let entry = DayEntry {
                 time,
                 summary: ev.summary.clone(),
@@ -557,6 +567,7 @@ pub fn expand(events: &[IcsEvent], from: NaiveDate, days: i64) -> Vec<(NaiveDate
                 first_day,
                 last_day,
                 starts_at,
+                key,
             };
             for (day, entries) in &mut by_day {
                 if *day >= first_day && *day <= last_day {
@@ -785,6 +796,20 @@ mod tests {
         let days = days_with(&parse_ics(ics), date(2026, 10, 4), 21);
 
         assert_eq!(days, vec![date(2026, 10, 4), date(2026, 10, 12)]);
+
+        // The moved occurrence keeps its key (the series date it replaces),
+        // so the week update reports it as moved, not as new and cancelled.
+        let keys: Vec<String> = expand(&parse_ics(ics), date(2026, 10, 4), 21)
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(keys, ["s#2026-10-04", "s#2026-10-11"]);
+        let single = vevent("UID:one\r\nSUMMARY:Party\r\nDTSTART:20261012T200000");
+        assert_eq!(
+            expand(&parse_ics(&single), date(2026, 10, 12), 1)[0].1[0].key,
+            "one"
+        );
     }
 
     #[test]

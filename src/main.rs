@@ -1,8 +1,9 @@
 mod ics;
 mod render;
+mod update;
 
 use anyhow::{Context, Result};
-use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -118,6 +119,10 @@ struct WeeklySummaryConfig {
     time: TimeOfDay,
     #[serde(default)]
     post_if_empty: bool,
+    /// Post the rest of the week again when events in it are added, moved
+    /// or cancelled after the overview. Default: on.
+    #[serde(default = "default_true")]
+    updates: bool,
 }
 
 impl Default for WeeklySummaryConfig {
@@ -127,6 +132,7 @@ impl Default for WeeklySummaryConfig {
             day: default_weekly_day(),
             time: default_reminder_time(),
             post_if_empty: false,
+            updates: true,
         }
     }
 }
@@ -184,6 +190,7 @@ struct Schedule {
     weekly_day: String,
     weekly_time: TimeOfDay,
     weekly_post_if_empty: bool,
+    weekly_updates: bool,
     monthly_enabled: bool,
     monthly_day: u32,
     monthly_time: TimeOfDay,
@@ -200,6 +207,7 @@ impl Schedule {
             weekly_day: config.weekly.day.clone(),
             weekly_time: config.weekly.time,
             weekly_post_if_empty: config.weekly.post_if_empty,
+            weekly_updates: config.weekly.updates,
             monthly_enabled: config.monthly.enabled,
             monthly_day: config.monthly.day,
             monthly_time: config.monthly.time,
@@ -217,6 +225,7 @@ struct BotState {
     config: CalendarConfig,
     schedule: Settings<Schedule>,
     posted: PostedStore,
+    week: WeekStore,
 }
 
 // ── Posted markers ────────────────────────────────────────────────────────────
@@ -283,6 +292,36 @@ impl PostedStore {
             *posted
         };
         if let Err(e) = persist::save_json_atomic(&self.path, &snapshot).await {
+            warn!("Could not save {}: {e:#}", self.path.display());
+        }
+    }
+}
+
+/// The snapshot of the last weekly overview (`store/week.json`), what
+/// [`update_loop`] compares with. A failed write is logged: the next check
+/// would then report the same changes once more.
+#[derive(Clone)]
+struct WeekStore {
+    path: PathBuf,
+    inner: Arc<Mutex<Option<update::WeekSnapshot>>>,
+}
+
+impl WeekStore {
+    async fn load(path: PathBuf) -> Result<Self> {
+        let week: Option<update::WeekSnapshot> = persist::load_json_or_default(&path).await?;
+        Ok(Self {
+            path,
+            inner: Arc::new(Mutex::new(week)),
+        })
+    }
+
+    fn get(&self) -> Option<update::WeekSnapshot> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    async fn set(&self, week: update::WeekSnapshot) {
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = Some(week.clone());
+        if let Err(e) = persist::save_json_atomic(&self.path, &Some(week)).await {
             warn!("Could not save {}: {e:#}", self.path.display());
         }
     }
@@ -811,7 +850,7 @@ async fn check_and_post(state: &BotState, kind: Summary, post_if_empty: bool) ->
         }
         Summary::Weekly => {
             let loaded = load(state, today, 7).await;
-            post_scheduled(state, what, &loaded, post_if_empty, || {
+            let handled = post_scheduled(state, what, &loaded, post_if_empty, || {
                 render::range_message(
                     &render::week_title(today),
                     &loaded.days,
@@ -820,7 +859,18 @@ async fn check_and_post(state: &BotState, kind: Summary, post_if_empty: bool) ->
                     loaded.total,
                 )
             })
-            .await
+            .await;
+            // Also after a silent (empty) week: an event added later is news.
+            if handled {
+                let week = update::WeekSnapshot::of(
+                    &loaded.days,
+                    today + Duration::days(6),
+                    Local::now().naive_local(),
+                    loaded.failed == 0,
+                );
+                state.week.set(week).await;
+            }
+            handled
         }
         Summary::Monthly => {
             // From today to the end of the month: days already past are no
@@ -898,6 +948,107 @@ async fn scheduler_loop(state: BotState, kind: Summary, test_mode: bool) {
             );
         }
         sleep_until_or_changed(secs, &mut changes).await;
+    }
+}
+
+/// How often [`update_loop`] looks for changes in the rest of the week.
+const UPDATE_CHECK: Duration = Duration::minutes(30);
+/// The least time between two posts of the week (overview or update).
+const UPDATE_GAP: Duration = Duration::minutes(60);
+/// No updates from 22:00 to 07:00; changes of the night come in the morning.
+const QUIET_FROM: u32 = 22;
+const QUIET_UNTIL: u32 = 7;
+
+/// Why the update check does nothing now, or `None` when it should load.
+fn update_wait(
+    now: NaiveDateTime,
+    schedule: &Schedule,
+    week: Option<&update::WeekSnapshot>,
+) -> Option<&'static str> {
+    let hour = now.hour();
+    let Some(week) = week else {
+        return Some("no weekly overview yet");
+    };
+    if !schedule.weekly_enabled || !schedule.weekly_updates {
+        Some("off")
+    } else if now.date() > week.until {
+        Some("the week of the last overview is over")
+    } else if !(QUIET_UNTIL..QUIET_FROM).contains(&hour) {
+        Some("quiet hours")
+    } else if week.complete && now - week.posted_at < UPDATE_GAP {
+        Some("posted less than an hour ago")
+    } else {
+        None
+    }
+}
+
+/// One check: load the rest of the week (and the weeks after it, to tell
+/// moved from cancelled), compare it with the last overview and post the
+/// rest of the week again when something changed.
+async fn check_week_update(state: &BotState) {
+    let now = Local::now().naive_local();
+    let Some(before) = state.week.get() else {
+        return;
+    };
+    if let Some(why) = update_wait(now, &state.schedule.get(), Some(&before)) {
+        info!("Week update: not now ({why})");
+        return;
+    }
+    let today = now.date();
+    let loaded = load(state, today, NEXT_LOOKAHEAD_DAYS).await;
+    // A missing calendar would look like cancelled events.
+    if loaded.failed > 0 {
+        warn!(
+            "Week update skipped: {} of {} calendar(s) failed",
+            loaded.failed, loaded.total
+        );
+        return;
+    }
+    let in_week = ((before.until - today).num_days() + 1) as usize;
+    let (week, later) = loaded.days.split_at(in_week.min(loaded.days.len()));
+    if !before.complete {
+        info!("Week update: the last overview missed a calendar, taking this load as its state");
+        state
+            .week
+            .set(update::WeekSnapshot::of(
+                week,
+                before.until,
+                before.posted_at,
+                true,
+            ))
+            .await;
+        return;
+    }
+    let found = update::changes(&before, week, later, now);
+    if found.is_empty() {
+        info!("Week update: no changes");
+        return;
+    }
+    info!(
+        "Posting week update ({} changed, {} gone)",
+        found.marks.len(),
+        found.gone.len()
+    );
+    let (plain, html) = render::update_message(
+        week,
+        today,
+        &found.marks,
+        &found.gone,
+        loaded.failed,
+        loaded.total,
+    );
+    state.broadcast("week update", &plain, &html).await;
+    state
+        .week
+        .set(update::WeekSnapshot::of(week, before.until, now, true))
+        .await;
+}
+
+/// Check the rest of the week every [`UPDATE_CHECK`].
+async fn update_loop(state: BotState) {
+    loop {
+        check_week_update(&state).await;
+        sleep(TokioDuration::from_secs(UPDATE_CHECK.num_seconds() as u64)).await;
     }
 }
 
@@ -988,6 +1139,7 @@ async fn command_reply(state: &BotState, command: Command) -> render::Message {
 const ADMIN_HELP: &str = "⚙️ Settings (!admin settings):\n\
 daily_*, weekly_*, monthly_*\n\
 with enabled, time, day, post_if_empty\n\
+weekly_updates: post the rest of the week again after changes\n\
 \n\
 👥 For everyone:\n\
 !today · !week · !month · !next · !calendar";
@@ -1028,12 +1180,16 @@ async fn main() -> Result<()> {
         config: config.calendar,
         schedule,
         posted: PostedStore::load(store_path.join("posted.json")).await?,
+        week: WeekStore::load(store_path.join("week.json")).await?,
     };
 
     install_message_handler(&state);
 
     for kind in [Summary::Daily, Summary::Weekly, Summary::Monthly] {
         tokio::spawn(scheduler_loop(state.clone(), kind, test_mode));
+    }
+    if !test_mode {
+        tokio::spawn(update_loop(state.clone()));
     }
 
     info!("Starting sync...");
@@ -1203,6 +1359,7 @@ mod tests {
             weekly_day: day.to_owned(),
             weekly_time: time,
             weekly_post_if_empty: false,
+            weekly_updates: true,
             monthly_enabled: true,
             monthly_day: 1,
             monthly_time: time,
@@ -1337,6 +1494,83 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn the_week_snapshot_survives_a_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "calendar-bot-week-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("week.json");
+        let store = WeekStore::load(path.clone()).await.unwrap();
+        assert_eq!(store.get(), None);
+
+        let week = update::WeekSnapshot::of(&[], date(2026, 10, 25), at(2026, 10, 19, 7, 0), false);
+        store.set(week.clone()).await;
+        assert_eq!(WeekStore::load(path).await.unwrap().get(), Some(week));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn week_updates_wait_for_the_day_the_gap_and_the_switch() {
+        let mut schedule = schedule("monday", TimeOfDay::new(7, 0));
+        schedule.weekly_enabled = true;
+        schedule.weekly_updates = true;
+        let week = update::WeekSnapshot::of(&[], date(2026, 10, 25), at(2026, 10, 19, 7, 0), true);
+
+        assert_eq!(
+            update_wait(at(2026, 10, 19, 7, 30), &schedule, Some(&week)),
+            Some("posted less than an hour ago")
+        );
+        assert_eq!(
+            update_wait(at(2026, 10, 19, 8, 0), &schedule, Some(&week)),
+            None
+        );
+        assert_eq!(
+            update_wait(at(2026, 10, 21, 21, 59), &schedule, Some(&week)),
+            None
+        );
+        assert_eq!(
+            update_wait(at(2026, 10, 21, 22, 0), &schedule, Some(&week)),
+            Some("quiet hours")
+        );
+        assert_eq!(
+            update_wait(at(2026, 10, 22, 6, 59), &schedule, Some(&week)),
+            Some("quiet hours")
+        );
+        assert_eq!(
+            update_wait(at(2026, 10, 25, 12, 0), &schedule, Some(&week)),
+            None
+        );
+        assert_eq!(
+            update_wait(at(2026, 10, 26, 12, 0), &schedule, Some(&week)),
+            Some("the week of the last overview is over")
+        );
+        assert_eq!(
+            update_wait(at(2026, 10, 21, 12, 0), &schedule, None),
+            Some("no weekly overview yet")
+        );
+
+        // A snapshot that missed a calendar is completed at once.
+        let partial = update::WeekSnapshot {
+            complete: false,
+            ..week.clone()
+        };
+        assert_eq!(
+            update_wait(at(2026, 10, 19, 7, 30), &schedule, Some(&partial)),
+            None
+        );
+
+        schedule.weekly_updates = false;
+        assert_eq!(
+            update_wait(at(2026, 10, 21, 12, 0), &schedule, Some(&week)),
+            Some("off")
+        );
+    }
+
     #[test]
     fn disabled_log_line_keeps_its_old_wording() {
         assert_eq!(capitalize(Summary::Monthly.name()), "Monthly summary");
@@ -1354,6 +1588,7 @@ mod tests {
         assert!(schedule.weekly_enabled);
         assert_eq!(schedule.weekly_day, "friday");
         assert_eq!(schedule.weekly_time, TimeOfDay::new(18, 30));
+        assert!(schedule.weekly_updates);
         assert!(!schedule.monthly_enabled);
     }
 }
