@@ -49,16 +49,27 @@ fn default_monthly_day() -> u32 {
     1
 }
 
-fn parse_weekday(s: &str) -> Weekday {
-    match s.to_lowercase().as_str() {
+/// An English weekday, full or short, any case; None for anything else.
+fn weekday(s: &str) -> Option<Weekday> {
+    Some(match s.trim().to_lowercase().as_str() {
+        "monday" | "mon" => Weekday::Mon,
         "tuesday" | "tue" => Weekday::Tue,
         "wednesday" | "wed" => Weekday::Wed,
         "thursday" | "thu" => Weekday::Thu,
         "friday" | "fri" => Weekday::Fri,
         "saturday" | "sat" => Weekday::Sat,
         "sunday" | "sun" => Weekday::Sun,
-        _ => Weekday::Mon,
-    }
+        _ => return None,
+    })
+}
+
+/// The weekly overview's day. The config's is checked at the start; one set later that is no
+/// weekday counts as Monday (logged).
+fn parse_weekday(s: &str) -> Weekday {
+    weekday(s).unwrap_or_else(|| {
+        warn!(day = %s, "Not a weekday: the weekly overview goes out on Monday");
+        Weekday::Mon
+    })
 }
 
 /// Returns the date for day-of-month `day` in the given year/month,
@@ -315,13 +326,12 @@ impl WeekStore {
 
 impl BotState {
     async fn broadcast(&self, what: &str, plain: &str, html: &str) {
-        for room in self.bot.broadcast_rooms() {
-            if let Err(e) = room
-                .send(RoomMessageEventContent::text_html(plain, html))
-                .await
-            {
-                error!("Failed to send {what} to {}: {e}", room.room_id());
-            }
+        for (room, e) in self
+            .bot
+            .broadcast(RoomMessageEventContent::text_html(plain, html))
+            .await
+        {
+            error!("Failed to send {what} to {room}: {e}");
         }
     }
 }
@@ -927,6 +937,12 @@ async fn main() -> Result<()> {
     if config.calendar.sources.is_empty() {
         anyhow::bail!("Config [calendar]: add at least one [[calendar.sources]] entry");
     }
+    if weekday(&config.calendar.weekly.day).is_none() {
+        anyhow::bail!(
+            "Config [calendar.weekly] day = {:?}: not a weekday (monday … sunday)",
+            config.calendar.weekly.day
+        );
+    }
 
     let store_path = mxbot_common::config::store_path_from_env();
     let schedule = Settings::load(
@@ -994,9 +1010,11 @@ fn install_message_handler(state: &BotState) {
                     return;
                 };
                 let (plain, html) = command_reply(&state, command).await;
-                if let Err(e) = room
-                    .send(RoomMessageEventContent::text_html(plain, html))
-                    .await
+                if let Err(e) = mxbot_common::send::send_with_retry(
+                    &room,
+                    RoomMessageEventContent::text_html(plain, html),
+                )
+                .await
                 {
                     error!("Failed to answer {command:?}: {e}");
                 }
@@ -1071,9 +1089,11 @@ mod tests {
     }
 
     #[test]
-    fn weekday_names_default_to_monday() {
-        assert_eq!(parse_weekday("Friday"), Weekday::Fri);
-        assert_eq!(parse_weekday("sun"), Weekday::Sun);
+    fn weekday_names_and_nothing_else() {
+        assert_eq!(weekday("Friday"), Some(Weekday::Fri));
+        assert_eq!(weekday(" sun "), Some(Weekday::Sun));
+        assert_eq!(weekday("monday"), Some(Weekday::Mon));
+        assert_eq!(weekday("nonsense"), None);
         assert_eq!(parse_weekday("nonsense"), Weekday::Mon);
     }
 
