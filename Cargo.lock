@@ -2106,12 +2106,15 @@ dependencies = [
 [[package]]
 name = "mxbot-common"
 version = "0.2.0"
-source = "git+https://github.com/PolynomialDivision/mxbot-common#022ad878fcf3961904470a3dd1c87557882ce239"
+source = "git+https://github.com/PolynomialDivision/mxbot-common#d58f5a3ece3c3d975a3e468f0cd4b8856b077c1d"
 dependencies = [
  "anyhow",
+ "chrono",
+ "chrono-tz",
  "futures-util",
  "matrix-sdk",
  "matrix-sdk-crypto",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
