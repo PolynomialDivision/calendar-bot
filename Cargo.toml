@@ -11,7 +11,7 @@ path = "src/main.rs"
 anyhow = "1"
 chrono = "0.4"
 chrono-tz = "0.10.4"
-mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }
+mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common", features = ["calendar"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

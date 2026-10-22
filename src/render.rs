@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 
-use crate::ics::{DayEntry, EntryTime};
+use mxbot_common::calendar::ics::{DayEntry, EntryTime};
 
 const MAX_TITLE_CHARS: usize = 120;
 const MAX_LOCATION_CHARS: usize = 40;

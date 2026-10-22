@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
-use crate::ics::{DayEntry, EntryTime};
 use crate::render::{Gone, Mark};
+use mxbot_common::calendar::ics::{DayEntry, EntryTime};
 
 /// One event as the last overview showed it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
