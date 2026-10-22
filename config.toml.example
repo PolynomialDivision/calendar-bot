@@ -56,6 +56,7 @@ password = "yourapppassword"
 # caldav_account_url = "https://cloud.example.com/remote.php/dav/calendars/user/"
 # username = "youruser"
 # password = "yourapppassword"
+# password_env = "CALDAV_PASSWORD"   # instead of password: read from this environment variable
 # exclude = ["contact_birthdays", "holidays-in-germany"]  # optional
 
 # --- Source 4: another ICS calendar (e.g. public holiday feed) ---

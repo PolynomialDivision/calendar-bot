@@ -2,7 +2,7 @@ use mxbot_common::calendar::{caldav, ics};
 mod render;
 mod update;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 use std::{
     path::PathBuf,
@@ -931,11 +931,17 @@ async fn main() -> Result<()> {
     mxbot_common::logging::init("calendar_bot");
 
     let test_mode = std::env::args().any(|a| a == "--test");
-    let config: Config =
+    let mut config: Config =
         mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
 
     if config.calendar.sources.is_empty() {
         anyhow::bail!("Config [calendar]: add at least one [[calendar.sources]] entry");
+    }
+    // A source's password may come from the environment (password_env, e.g. CALDAV_PASSWORD:
+    // the app password the deployment writes next to the bot); a missing one stops the start.
+    for (i, src) in config.calendar.sources.iter_mut().enumerate() {
+        src.resolve_password_env()
+            .with_context(|| format!("[[calendar.sources]] {}", i + 1))?;
     }
     if weekday(&config.calendar.weekly.day).is_none() {
         anyhow::bail!(
