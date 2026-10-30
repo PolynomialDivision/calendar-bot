@@ -3,13 +3,17 @@ mod render;
 mod update;
 
 use anyhow::{Context, Result};
-use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
+#[cfg(test)]
+use chrono::NaiveTime;
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, Timelike, Utc, Weekday};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use mxbot_common::{
+    clock::Zone,
     config::{MatrixConfig, SecurityConfig, TimeOfDay},
     matrix_sdk::{
         deserialized_responses::EncryptionInfo,
@@ -19,12 +23,13 @@ use mxbot_common::{
         Room, RoomState,
     },
     persist,
+    schedule::{self, Delivery, Job, JsonLedger, Outcome, Rule, Slot},
     settings::Settings,
-    supervise::{supervise, supervise_ticking, Alive},
+    supervise::{supervise_ticking, Alive},
     Bot,
 };
 use serde::{Deserialize, Serialize};
-use tokio::{sync::watch, time::sleep, time::Duration as TokioDuration};
+use tokio::{time::sleep, time::Duration as TokioDuration};
 use tracing::{error, info, warn};
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -70,19 +75,6 @@ fn parse_weekday(s: &str) -> Weekday {
     weekday(s).unwrap_or_else(|| {
         warn!(day = %s, "Not a weekday: the weekly overview goes out on Monday");
         Weekday::Mon
-    })
-}
-
-/// Returns the date for day-of-month `day` in the given year/month,
-/// clamping to the last day if the month is shorter (e.g. day 31 in April → 30 Apr).
-fn month_day(year: i32, month: u32, day: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(year, month, day).unwrap_or_else(|| {
-        let next = if month == 12 {
-            NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap()
-        } else {
-            NaiveDate::from_ymd_opt(year, month + 1, 1).unwrap()
-        };
-        next - Duration::days(1)
     })
 }
 
@@ -222,6 +214,8 @@ struct BotState {
     http: reqwest::Client,
     config: CalendarConfig,
     schedule: Settings<Schedule>,
+    /// `TZ` (as compose sets it), else Europe/Berlin: the summaries' times and days.
+    zone: Zone,
     posted: PostedStore,
     week: WeekStore,
 }
@@ -229,68 +223,34 @@ struct BotState {
 // ── Posted markers ────────────────────────────────────────────────────────────
 
 /// The scheduled run each summary last handled, as the date of that run,
-/// persisted in `store/posted.json`. Without it a restart around the
-/// scheduled minute would lose the post for good: the fresh process only
-/// looks ahead to the next run.
-#[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq, Debug)]
-struct Posted {
-    daily: Option<NaiveDate>,
-    weekly: Option<NaiveDate>,
-    monthly: Option<NaiveDate>,
-}
-
-impl Posted {
-    fn get(&self, kind: Summary) -> Option<NaiveDate> {
-        match kind {
-            Summary::Daily => self.daily,
-            Summary::Weekly => self.weekly,
-            Summary::Monthly => self.monthly,
-        }
-    }
-
-    fn set(&mut self, kind: Summary, date: NaiveDate) {
-        let slot = match kind {
-            Summary::Daily => &mut self.daily,
-            Summary::Weekly => &mut self.weekly,
-            Summary::Monthly => &mut self.monthly,
-        };
-        *slot = Some(date);
-    }
-}
-
+/// persisted in `store/posted.json` (`{"daily": "2026-10-12", …}`): the
+/// schedule's ledger. Without it a restart around the scheduled minute would
+/// lose the post for good: the fresh process only looks ahead to the next
+/// run. A date counts for its whole day, week or month, so moving the time
+/// after a post does not post that period again. The file keeps the shape
+/// older versions read; one that does not parse is moved aside.
 #[derive(Clone)]
 struct PostedStore {
-    path: PathBuf,
-    inner: Arc<Mutex<Posted>>,
+    ledger: JsonLedger,
 }
 
 impl PostedStore {
     async fn load(path: PathBuf) -> Result<Self> {
-        let posted: Posted = persist::load_json_or_default(&path).await?;
         Ok(Self {
-            path,
-            inner: Arc::new(Mutex::new(posted)),
+            ledger: JsonLedger::open_dated(path).await?,
         })
     }
 
     fn get(&self, kind: Summary) -> Option<NaiveDate> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(kind)
+        self.ledger.recorded(kind.entry())?.parse().ok()
     }
 
-    /// Remember that the run of `kind` dated `date` was handled. A failed
-    /// write only costs a possible repeat after the next restart, so it is
-    /// logged rather than propagated.
+    /// Remember that the run of `kind` dated `date` was handled (the
+    /// schedule's runner does this itself).
+    #[cfg(test)]
     async fn mark(&self, kind: Summary, date: NaiveDate) {
-        let snapshot = {
-            let mut posted = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            posted.set(kind, date);
-            *posted
-        };
-        if let Err(e) = persist::save_json_atomic(&self.path, &snapshot).await {
-            warn!("Could not save {}: {e:#}", self.path.display());
+        if let Err(e) = self.ledger.record(kind.entry(), date.to_string()).await {
+            warn!("Could not save posted.json: {e:#}");
         }
     }
 }
@@ -302,6 +262,9 @@ impl PostedStore {
 struct WeekStore {
     path: PathBuf,
     inner: Arc<Mutex<Option<update::WeekSnapshot>>>,
+    /// One save at a time, in order: the weekly overview and the update
+    /// check may both set the snapshot.
+    writer: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl WeekStore {
@@ -310,6 +273,7 @@ impl WeekStore {
         Ok(Self {
             path,
             inner: Arc::new(Mutex::new(week)),
+            writer: Arc::default(),
         })
     }
 
@@ -318,6 +282,7 @@ impl WeekStore {
     }
 
     async fn set(&self, week: update::WeekSnapshot) {
+        let _writing = self.writer.lock().await;
         *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = Some(week.clone());
         if let Err(e) = persist::save_json_atomic(&self.path, &Some(week)).await {
             warn!("Could not save {}: {e:#}", self.path.display());
@@ -325,23 +290,41 @@ impl WeekStore {
     }
 }
 
-impl BotState {
-    async fn broadcast(&self, what: &str, plain: &str, html: &str) {
-        for (room, e) in self
-            .bot
-            .broadcast(RoomMessageEventContent::text_html(plain, html))
-            .await
-        {
-            error!("Failed to send {what} to {room}: {e}");
-        }
-    }
+/// How long one post keeps retrying a homeserver that does not answer
+/// (a restart, an outage of minutes) before the run is tried again later.
+const SEND_FOR: TokioDuration = TokioDuration::from_secs(10 * 60);
+
+/// One post: the day it is about, the key of its transaction IDs (it names
+/// the run: summary and slot, so a run tried again after a crash or a failed
+/// send gets no second copy where it arrived), and until when to retry.
+struct Run {
+    today: NaiveDate,
+    key: String,
+    deadline: Instant,
 }
 
-/// Sleep for `secs`, or until the schedule settings change.
-async fn sleep_until_or_changed(secs: u64, changes: &mut watch::Receiver<u64>) {
-    tokio::select! {
-        _ = sleep(TokioDuration::from_secs(secs)) => {}
-        _ = changes.changed() => {}
+impl BotState {
+    /// Post into the broadcast rooms with transaction IDs from `key`,
+    /// retrying transient failures until `deadline`; failures are logged.
+    async fn post(
+        &self,
+        what: &str,
+        plain: &str,
+        html: &str,
+        key: &str,
+        deadline: Instant,
+    ) -> schedule::Delivered {
+        let delivered = schedule::post(
+            self.bot.broadcast_rooms(),
+            RoomMessageEventContent::text_html(plain, html),
+            key,
+            deadline,
+        )
+        .await;
+        for (room, e) in &delivered.failed {
+            error!("Failed to send {what} to {room}: {e}");
+        }
+        delivered
     }
 }
 
@@ -393,99 +376,101 @@ async fn load(state: &BotState, from: NaiveDate, days: i64) -> Loaded {
 
 /// Post a scheduled overview, unless it would be empty and `post_if_empty`
 /// is off. When no calendar could be reached, nothing is posted: "no events"
-/// would be a claim we can't make. Returns whether the run counts as
-/// handled, which it does not in that last case, so it can be retried.
+/// would be a claim we can't make. The run then counts as not handled, as it
+/// does when the post reached no room (or failed in one for a reason that
+/// may pass), so it is tried again after [`RETRY_AFTER`].
 async fn post_scheduled(
     state: &BotState,
     what: &str,
     loaded: &Loaded,
     post_if_empty: bool,
+    run: &Run,
     message: impl FnOnce() -> render::Message,
-) -> bool {
+) -> Outcome {
     if loaded.all_failed() {
         error!("Skipping {what}: no calendar source could be loaded");
-        return false;
+        return Outcome::RetryIn(RETRY_AFTER);
     }
     let count = loaded.event_count();
     if count == 0 && !post_if_empty {
         info!("No events for the {what}, staying silent");
-        return true;
+        return Outcome::Skipped;
     }
     let (plain, html) = message();
     info!("Posting {what} ({count} event(s)) to Matrix");
-    state.broadcast(what, &plain, &html).await;
-    true
+    state
+        .post(what, &plain, &html, &run.key, run.deadline)
+        .await
+        .outcome(RETRY_AFTER)
 }
 
+// The next and last runs are the shared schedule's (mxbot_common::schedule::Rule);
+// these keep the tests that pin them.
+
 /// The next time `time` occurs strictly after `now` (today or tomorrow).
+#[cfg(test)]
 fn next_daily_run(now: NaiveDateTime, time: NaiveTime) -> NaiveDateTime {
-    let today = now.date();
-    if now.time() < time {
-        today.and_time(time)
-    } else {
-        (today + Duration::days(1)).and_time(time)
-    }
+    next_local(&Rule::daily(time_of_day(time)), now)
 }
 
 /// The next `weekday` at `time` after `now`; a week later if that moment
 /// has already passed today.
+#[cfg(test)]
 fn next_weekly_run(now: NaiveDateTime, weekday: Weekday, time: NaiveTime) -> NaiveDateTime {
-    let today = now.date();
-    let days_until = (weekday.num_days_from_monday() as i64
-        - today.weekday().num_days_from_monday() as i64)
-        .rem_euclid(7);
-    let days_until = if days_until == 0 && now.time() >= time {
-        7
-    } else {
-        days_until
+    let rule = Rule::Weekly {
+        day: weekday,
+        at: time_of_day(time),
     };
-    (today + Duration::days(days_until)).and_time(time)
+    next_local(&rule, now)
 }
 
 /// The next day-of-month `day` (1–31, clamped to short months) at `time`
 /// after `now`: this month if still ahead, otherwise next month.
+#[cfg(test)]
 fn next_monthly_run(now: NaiveDateTime, day: u32, time: NaiveTime) -> NaiveDateTime {
-    let today = now.date();
-    let day = day.clamp(1, 31);
-    let candidate = month_day(today.year(), today.month(), day);
-    let date = if candidate > today || (candidate == today && now.time() < time) {
-        candidate
-    } else if today.month() == 12 {
-        month_day(today.year() + 1, 1, day)
-    } else {
-        month_day(today.year(), today.month() + 1, day)
+    let rule = Rule::Monthly {
+        day,
+        at: time_of_day(time),
     };
-    date.and_time(time)
+    next_local(&rule, now)
 }
 
 /// The most recent day-of-month `day` at `time` that is not after `now`.
+#[cfg(test)]
 fn last_monthly_run(now: NaiveDateTime, day: u32, time: NaiveTime) -> NaiveDateTime {
-    let today = now.date();
-    let day = day.clamp(1, 31);
-    let candidate = month_day(today.year(), today.month(), day).and_time(time);
-    if candidate <= now {
-        candidate
-    } else if today.month() == 1 {
-        month_day(today.year() - 1, 12, day).and_time(time)
-    } else {
-        month_day(today.year(), today.month() - 1, day).and_time(time)
-    }
+    let rule = Rule::Monthly {
+        day,
+        at: time_of_day(time),
+    };
+    rule.latest_local(now)
+        .expect("a monthly rule always has a run")
 }
 
-fn naive_time(t: TimeOfDay) -> NaiveTime {
-    NaiveTime::from_hms_opt(t.hour, t.minute, 0).expect("TimeOfDay is validated")
+#[cfg(test)]
+fn time_of_day(t: NaiveTime) -> TimeOfDay {
+    TimeOfDay::new(t.hour(), t.minute())
+}
+
+#[cfg(test)]
+fn next_local(rule: &Rule, now: NaiveDateTime) -> NaiveDateTime {
+    rule.next_local(now).expect("every summary rule has a time")
 }
 
 /// Whole seconds from `now` until `target`, rounded up so a timer never
 /// fires just short of the moment it waits for.
+#[cfg(test)]
 fn secs_until(now: NaiveDateTime, target: NaiveDateTime) -> u64 {
     let millis = (target - now).num_milliseconds().max(0);
     ((millis + 999) / 1000) as u64
 }
 
 /// How long to wait before retrying a run whose calendars were all
-/// unreachable.
-const RETRY_AFTER: Duration = Duration::minutes(15);
+/// unreachable, or whose post did not get through.
+const RETRY_AFTER: TokioDuration = TokioDuration::from_secs(15 * 60);
+
+/// The longest a summary's run takes: its calendar loads (30 s timeouts)
+/// and a post retried for [`SEND_FOR`].
+const LONGEST_RUN: TokioDuration = TokioDuration::from_secs(20 * 60);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Summary {
@@ -500,6 +485,15 @@ impl Summary {
             Self::Daily => "daily summary",
             Self::Weekly => "weekly summary",
             Self::Monthly => "monthly summary",
+        }
+    }
+
+    /// Its key in `store/posted.json`.
+    fn entry(self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
         }
     }
 
@@ -519,34 +513,32 @@ impl Summary {
         }
     }
 
-    fn time(self, schedule: &Schedule) -> NaiveTime {
-        naive_time(match self {
-            Self::Daily => schedule.daily_time,
-            Self::Weekly => schedule.weekly_time,
-            Self::Monthly => schedule.monthly_time,
-        })
+    /// When the summary is due, in local time.
+    fn rule(self, schedule: &Schedule) -> Rule {
+        match self {
+            Self::Daily => Rule::daily(schedule.daily_time),
+            Self::Weekly => Rule::Weekly {
+                day: parse_weekday(&schedule.weekly_day),
+                at: schedule.weekly_time,
+            },
+            Self::Monthly => Rule::Monthly {
+                day: schedule.monthly_day,
+                at: schedule.monthly_time,
+            },
+        }
     }
 
     /// The first scheduled run strictly after `now`.
+    #[cfg(test)]
     fn next_run(self, now: NaiveDateTime, schedule: &Schedule) -> NaiveDateTime {
-        let time = self.time(schedule);
-        match self {
-            Self::Daily => next_daily_run(now, time),
-            Self::Weekly => next_weekly_run(now, parse_weekday(&schedule.weekly_day), time),
-            Self::Monthly => next_monthly_run(now, schedule.monthly_day, time),
-        }
+        next_local(&self.rule(schedule), now)
     }
 
     /// The most recent scheduled run at or before `now`.
     fn last_run(self, now: NaiveDateTime, schedule: &Schedule) -> NaiveDateTime {
-        let time = self.time(schedule);
-        match self {
-            Self::Daily => next_daily_run(now, time) - Duration::days(1),
-            Self::Weekly => {
-                next_weekly_run(now, parse_weekday(&schedule.weekly_day), time) - Duration::days(7)
-            }
-            Self::Monthly => last_monthly_run(now, schedule.monthly_day, time),
-        }
+        self.rule(schedule)
+            .latest_local(now)
+            .expect("every summary rule has a time")
     }
 
     /// How long after its scheduled moment a missed run is still worth
@@ -560,16 +552,38 @@ impl Summary {
         }
     }
 
-    fn describe_run(self, run: NaiveDateTime, schedule: &Schedule) -> String {
-        let time = match self {
-            Self::Daily => schedule.daily_time,
-            Self::Weekly => schedule.weekly_time,
-            Self::Monthly => schedule.monthly_time,
-        };
-        match self {
-            Self::Daily => format!("at {time}"),
-            Self::Weekly => format!("on {} at {time}", run.format("%A %d %b")),
-            Self::Monthly => format!("on {} at {time}", run.format("%d %b %Y")),
+    /// The summary as a scheduled job: due at its time in `zone`, caught up
+    /// within [`Summary::catch_up_window`], recorded in `store/posted.json`
+    /// once handled. Settings changes apply at once.
+    fn job(self, settings: &Settings<Schedule>, zone: Zone) -> Job {
+        let schedule = settings.clone();
+        let catch_up = self.catch_up_window().to_std().expect("a positive window");
+        Job::new(
+            self.name(),
+            zone,
+            Delivery::AtLeastOnce,
+            catch_up,
+            move || {
+                let schedule = schedule.get();
+                self.enabled(&schedule).then(|| self.rule(&schedule))
+            },
+        )
+        .entry(self.entry())
+        .wake_on(settings.store().subscribe())
+    }
+
+    /// The post of `slot`: today's overview, its sends retried for
+    /// [`SEND_FOR`] but not past the catch-up window.
+    fn run(self, state: &BotState, slot: &Slot) -> Run {
+        let window_end = slot.at + self.catch_up_window();
+        let left = (window_end - Utc::now()).to_std().unwrap_or_default();
+        Run {
+            today: state.zone.now().date_naive(),
+            // The slot's date, not its period: a weekly day moved after the post runs
+            // again in the same week (see `JsonLedger::open_dated`), and with the week's
+            // key the homeserver would answer with the first post.
+            key: format!("calendar-bot:{}:{}", self.entry(), slot.local.date()),
+            deadline: Instant::now() + SEND_FOR.min(left),
         }
     }
 }
@@ -577,35 +591,41 @@ impl Summary {
 /// The scheduled run that is due now: the most recent one, unless it was
 /// already handled (`posted` holds its date) or lies too far back to be
 /// worth catching up on.
+#[cfg(test)]
 fn due_run(
     kind: Summary,
     now: NaiveDateTime,
     schedule: &Schedule,
     posted: Option<NaiveDate>,
 ) -> Option<NaiveDateTime> {
-    let last = kind.last_run(now, schedule);
-    if posted == Some(last.date()) || now - last > kind.catch_up_window() {
-        return None;
-    }
-    Some(last)
+    // In UTC the wall clock is the instant: the rule's own catch-up check.
+    let utc = Zone(mxbot_common::clock::Tz::UTC);
+    let window = kind.catch_up_window().to_std().unwrap();
+    let slot = kind.rule(schedule).due(utc, now.and_utc(), window)?;
+    (posted != Some(slot.local.date())).then_some(slot.local)
 }
 
-/// Load and post the overview of `kind` as of today; `true` when the run
-/// was handled (posted, or silent on purpose).
-async fn check_and_post(state: &BotState, kind: Summary, post_if_empty: bool) -> bool {
-    let today = Local::now().date_naive();
+/// Load and post the overview of `kind` as of `run.today`; whether the run
+/// was handled (posted, or silent on purpose) or is to be tried again.
+async fn check_and_post(
+    state: &BotState,
+    kind: Summary,
+    post_if_empty: bool,
+    run: &Run,
+) -> Outcome {
+    let today = run.today;
     let what = kind.name();
     match kind {
         Summary::Daily => {
             let loaded = load(state, today, 1).await;
-            post_scheduled(state, what, &loaded, post_if_empty, || {
+            post_scheduled(state, what, &loaded, post_if_empty, run, || {
                 render::day_message(today, today, &loaded.days[0].1, loaded.failed, loaded.total)
             })
             .await
         }
         Summary::Weekly => {
             let loaded = load(state, today, 7).await;
-            let handled = post_scheduled(state, what, &loaded, post_if_empty, || {
+            let outcome = post_scheduled(state, what, &loaded, post_if_empty, run, || {
                 render::range_message(
                     &render::week_title(today),
                     &loaded.days,
@@ -616,16 +636,16 @@ async fn check_and_post(state: &BotState, kind: Summary, post_if_empty: bool) ->
             })
             .await;
             // Also after a silent (empty) week: an event added later is news.
-            if handled {
+            if !matches!(outcome, Outcome::RetryIn(_)) {
                 let week = update::WeekSnapshot::of(
                     &loaded.days,
                     today + Duration::days(6),
-                    Local::now().naive_local(),
+                    state.zone.now().naive_local(),
                     loaded.failed == 0,
                 );
                 state.week.set(week).await;
             }
-            handled
+            outcome
         }
         Summary::Monthly => {
             // From today to the end of the month: days already past are no
@@ -633,7 +653,7 @@ async fn check_and_post(state: &BotState, kind: Summary, post_if_empty: bool) ->
             // month).
             let (first, days) = rest_of_month(today);
             let loaded = load(state, today, days).await;
-            post_scheduled(state, what, &loaded, post_if_empty, || {
+            post_scheduled(state, what, &loaded, post_if_empty, run, || {
                 render::range_message(
                     &render::month_title(first),
                     &loaded.days,
@@ -649,61 +669,39 @@ async fn check_and_post(state: &BotState, kind: Summary, post_if_empty: bool) ->
 
 /// Post `kind` whenever a run is due: at the scheduled moment, right after
 /// a (re)start that fell into the catch-up window of a run nobody handled,
-/// and again after [`RETRY_AFTER`] when the calendars were unreachable.
-async fn scheduler_loop(state: BotState, kind: Summary, test_mode: bool) {
-    let name = kind.name();
-    if test_mode {
-        let schedule = state.schedule.get();
-        if kind.enabled(&schedule) {
-            info!("Test mode: posting {name} immediately");
-            check_and_post(&state, kind, kind.post_if_empty(&schedule)).await;
+/// and again after [`RETRY_AFTER`] when the calendars or the homeserver were
+/// unreachable. Ticks `alive` at least every 15 minutes.
+async fn scheduler_loop(state: BotState, kind: Summary, alive: Alive) {
+    let job = kind.job(&state.schedule, state.zone);
+    let ledger = state.posted.ledger.clone();
+    schedule::run(job, ledger, alive, move |slot: Slot| {
+        let state = state.clone();
+        async move {
+            let run = kind.run(&state, &slot);
+            let post_if_empty = kind.post_if_empty(&state.schedule.get());
+            check_and_post(&state, kind, post_if_empty, &run).await
         }
+    })
+    .await
+}
+
+/// `--test`: post `kind` once, now, if it is enabled (outside the ledger).
+async fn post_now(state: BotState, kind: Summary) {
+    let schedule = state.schedule.get();
+    if !kind.enabled(&schedule) {
         return;
     }
-
-    let mut changes = state.schedule.store().subscribe();
-    loop {
-        let schedule = state.schedule.get();
-        if !kind.enabled(&schedule) {
-            info!("{} disabled", capitalize(name));
-            if changes.changed().await.is_err() {
-                return;
-            }
-            continue;
-        }
-        let now = Local::now().naive_local();
-        let mut wake_at = kind.next_run(now, &schedule);
-        let mut retrying = false;
-        if let Some(due) = due_run(kind, now, &schedule, state.posted.get(kind)) {
-            let late = now - due;
-            if late > Duration::minutes(1) {
-                info!(
-                    "Catching up the {name} scheduled {} ({}h {}m ago)",
-                    kind.describe_run(due, &schedule),
-                    late.num_hours(),
-                    late.num_minutes() % 60
-                );
-            }
-            if check_and_post(&state, kind, kind.post_if_empty(&schedule)).await {
-                state.posted.mark(kind, due.date()).await;
-                continue;
-            }
-            let retry_at = Local::now().naive_local() + RETRY_AFTER;
-            if retry_at < wake_at {
-                warn!("Retrying the {name} in {} min", RETRY_AFTER.num_minutes());
-                wake_at = retry_at;
-                retrying = true;
-            }
-        }
-        let secs = secs_until(Local::now().naive_local(), wake_at);
-        if !retrying {
-            info!(
-                "Next {name} in {secs}s ({})",
-                kind.describe_run(wake_at, &schedule)
-            );
-        }
-        sleep_until_or_changed(secs, &mut changes).await;
-    }
+    info!("Test mode: posting {} immediately", kind.name());
+    let run = Run {
+        today: state.zone.now().date_naive(),
+        key: format!(
+            "calendar-bot:{}:test:{}",
+            kind.entry(),
+            Utc::now().timestamp_millis()
+        ),
+        deadline: Instant::now() + SEND_FOR,
+    };
+    check_and_post(&state, kind, kind.post_if_empty(&schedule), &run).await;
 }
 
 /// How often [`update_loop`] looks for changes in the rest of the week.
@@ -758,7 +756,7 @@ fn missing_snapshot(
 /// moved from cancelled), compare it with the last overview and post the
 /// rest of the week again when something changed.
 async fn check_week_update(state: &BotState) {
-    let now = Local::now().naive_local();
+    let now = state.zone.now().naive_local();
     let Some(before) = state.week.get() else {
         let posted = state.posted.get(Summary::Weekly);
         let Some(run) = missing_snapshot(now, &state.schedule.get(), posted) else {
@@ -820,7 +818,26 @@ async fn check_week_update(state: &BotState) {
         loaded.failed,
         loaded.total,
     );
-    state.broadcast("week update", &plain, &html).await;
+    // The key names this update: the overview it follows and what it says.
+    // Not sent everywhere: the next check tries again, and rooms that have
+    // it get no second copy.
+    let key = format!(
+        "calendar-bot:week-update:{}:{}:{plain}",
+        before.until, before.posted_at
+    );
+    let delivered = state
+        .post(
+            "week update",
+            &plain,
+            &html,
+            &key,
+            Instant::now() + SEND_FOR,
+        )
+        .await;
+    if let Outcome::RetryIn(_) = delivered.outcome(RETRY_AFTER) {
+        warn!("Week update not delivered everywhere, trying again at the next check");
+        return;
+    }
     state
         .week
         .set(update::WeekSnapshot::of(week, before.until, now, true))
@@ -836,6 +853,7 @@ async fn update_loop(state: BotState, alive: Alive) {
     }
 }
 
+#[cfg(test)]
 fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
@@ -883,7 +901,7 @@ fn parse_command(body: &str) -> Option<Command> {
 }
 
 async fn command_reply(state: &BotState, command: Command) -> render::Message {
-    let now = Local::now().naive_local();
+    let now = state.zone.now().naive_local();
     let today = now.date();
     let (from, days) = match command {
         Command::Help => return render::help_message(),
@@ -952,6 +970,7 @@ async fn main() -> Result<()> {
         );
     }
 
+    let zone = Zone::resolve(None)?;
     let store_path = mxbot_common::config::store_path_from_env();
     let schedule = Settings::load(
         store_path.join("settings.json"),
@@ -975,6 +994,7 @@ async fn main() -> Result<()> {
             .build()?,
         config: config.calendar,
         schedule,
+        zone,
         posted: PostedStore::load(store_path.join("posted.json")).await?,
         week: WeekStore::load(store_path.join("week.json")).await?,
     };
@@ -982,12 +1002,16 @@ async fn main() -> Result<()> {
     install_message_handler(&state);
 
     for kind in [Summary::Daily, Summary::Weekly, Summary::Monthly] {
-        let task = scheduler_loop(state.clone(), kind, test_mode);
         // Test mode posts once and ends; otherwise a loop that ends restarts the bot.
         if test_mode {
-            tokio::spawn(task);
+            tokio::spawn(post_now(state.clone(), kind));
         } else {
-            supervise(kind.name(), task);
+            let within = kind
+                .job(&state.schedule, state.zone)
+                .stall_after(LONGEST_RUN);
+            supervise_ticking(kind.name(), within, |alive| {
+                scheduler_loop(state.clone(), kind, alive)
+            });
         }
     }
     if !test_mode {
@@ -1422,5 +1446,231 @@ mod tests {
         assert_eq!(schedule.weekly_time, TimeOfDay::new(18, 30));
         assert!(schedule.weekly_updates);
         assert!(!schedule.monthly_enabled);
+    }
+
+    // ── The shared schedule, as calendar-bot uses it ─────────────────────────
+
+    use mxbot_common::schedule::Runner;
+
+    const BERLIN: Zone = Zone::DEFAULT;
+
+    fn utc(s: &str) -> chrono::DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    /// A store directory with `posted.json` holding `posted` (if any), the
+    /// summary settings, and that directory.
+    async fn store(posted: Option<&str>) -> (PostedStore, Settings<Schedule>, tempfile_dir::Dir) {
+        let dir = tempfile_dir::Dir::new("schedule");
+        if let Some(posted) = posted {
+            std::fs::write(dir.path.join("posted.json"), posted).unwrap();
+        }
+        let posted = PostedStore::load(dir.path.join("posted.json"))
+            .await
+            .unwrap();
+        let settings = Settings::load(
+            dir.path.join("settings.json"),
+            schedule("monday", TimeOfDay::new(7, 0)),
+        )
+        .await
+        .unwrap();
+        (posted, settings, dir)
+    }
+
+    /// One round of `kind`'s job at `now`, its work answering `outcome`;
+    /// returns when it wants to look again and whether the work ran.
+    async fn round(
+        runner: &mut Runner,
+        posted: &PostedStore,
+        now: &str,
+        outcome: Outcome,
+    ) -> (Option<chrono::DateTime<Utc>>, bool) {
+        let mut ran = false;
+        let wake = runner
+            .round(&posted.ledger, utc(now), &mut |_slot: Slot| {
+                ran = true;
+                async move { outcome }
+            })
+            .await;
+        (wake, ran)
+    }
+
+    #[tokio::test]
+    async fn summaries_are_due_at_local_time_across_both_dst_changes() {
+        // Handled the day before each change; the next post is 07:00 local.
+        let (posted, settings, _dir) = store(Some(r#"{"daily":"2026-03-28"}"#)).await;
+        let mut daily = Runner::new(Summary::Daily.job(&settings, BERLIN));
+        // Saturday 23:00 CET: 07:00 CEST is 05:00 UTC, 7 hours on (not 8).
+        let (wake, ran) = round(&mut daily, &posted, "2026-03-28T22:00:00Z", Outcome::Done).await;
+        assert_eq!(wake, Some(utc("2026-03-29T05:00:00Z")));
+        assert!(!ran);
+        let (_, ran) = round(&mut daily, &posted, "2026-03-29T05:00:00Z", Outcome::Done).await;
+        assert!(ran);
+        assert_eq!(posted.get(Summary::Daily), Some(date(2026, 3, 29)));
+
+        let (posted, settings, _dir) = store(Some(r#"{"daily":"2026-10-24"}"#)).await;
+        let mut daily = Runner::new(Summary::Daily.job(&settings, BERLIN));
+        // Saturday midnight CEST: 07:00 CET is 06:00 UTC, 8 hours on (not 7).
+        let (wake, _) = round(&mut daily, &posted, "2026-10-24T22:00:00Z", Outcome::Done).await;
+        assert_eq!(wake, Some(utc("2026-10-25T06:00:00Z")));
+        // An hour early (where a naive sleep woke) nothing is due yet.
+        let (_, ran) = round(&mut daily, &posted, "2026-10-25T05:00:00Z", Outcome::Done).await;
+        assert!(!ran);
+        let (_, ran) = round(&mut daily, &posted, "2026-10-25T06:00:00Z", Outcome::Done).await;
+        assert!(ran);
+    }
+
+    #[tokio::test]
+    async fn a_post_that_reached_no_room_is_tried_again_not_recorded() {
+        let (posted, settings, _dir) = store(None).await;
+        let mut daily = Runner::new(Summary::Daily.job(&settings, BERLIN));
+        // Every send failed (here: for a reason that is not known to pass).
+        let failed = schedule::Delivered {
+            sent: Vec::new(),
+            failed: vec![(
+                "!room:house.org".try_into().unwrap(),
+                mxbot_common::matrix_sdk::Error::AuthenticationRequired,
+            )],
+        };
+        let outcome = failed.outcome(RETRY_AFTER);
+        assert_eq!(outcome, Outcome::RetryIn(RETRY_AFTER));
+
+        let (wake, ran) = round(&mut daily, &posted, "2026-10-12T05:00:00Z", outcome).await;
+        assert!(ran);
+        assert_eq!(wake, Some(utc("2026-10-12T05:00:00Z")));
+        assert_eq!(posted.get(Summary::Daily), None, "not marked as posted");
+        let (wake, ran) = round(&mut daily, &posted, "2026-10-12T05:01:00Z", Outcome::Done).await;
+        assert!(!ran);
+        assert_eq!(wake, Some(utc("2026-10-12T05:15:00Z")));
+        let (_, ran) = round(&mut daily, &posted, "2026-10-12T05:15:00Z", Outcome::Done).await;
+        assert!(ran);
+        assert_eq!(posted.get(Summary::Daily), Some(date(2026, 10, 12)));
+    }
+
+    #[tokio::test]
+    async fn daily_and_weekly_at_the_same_minute_both_stay_in_posted_json() {
+        let (posted, settings, dir) = store(None).await;
+        let mut daily = Runner::new(Summary::Daily.job(&settings, BERLIN));
+        let mut weekly = Runner::new(Summary::Weekly.job(&settings, BERLIN));
+        // Ten Mondays at 07:00 (05:00 UTC in summer time).
+        for week in 0..10 {
+            let monday = date(2026, 6, 1) + Duration::days(7 * week);
+            let now = format!("{monday}T05:00:00Z");
+            let (a, b) = tokio::join!(
+                round(&mut daily, &posted, &now, Outcome::Done),
+                round(&mut weekly, &posted, &now, Outcome::Done)
+            );
+            assert!(a.1 && b.1);
+            let reloaded = PostedStore::load(dir.path.join("posted.json"))
+                .await
+                .unwrap();
+            assert_eq!(reloaded.get(Summary::Daily), Some(monday));
+            assert_eq!(reloaded.get(Summary::Weekly), Some(monday));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restart_catches_up_but_never_posts_what_the_old_version_posted() {
+        // Written by the version before the shared schedule, Monday 07:00.
+        let old = r#"{"daily":"2026-10-12","weekly":"2026-10-12","monthly":null}"#;
+        let (posted, settings, _dir) = store(Some(old)).await;
+        let restart = "2026-10-12T09:55:00Z";
+        for kind in [Summary::Daily, Summary::Weekly] {
+            let mut runner = Runner::new(kind.job(&settings, BERLIN));
+            let (_, ran) = round(&mut runner, &posted, restart, Outcome::Done).await;
+            assert!(!ran, "{kind:?} posted twice");
+        }
+        // The 1st's monthly overview was never handled and is 11 days old.
+        let mut monthly = Runner::new(Summary::Monthly.job(&settings, BERLIN));
+        let (_, ran) = round(&mut monthly, &posted, restart, Outcome::Done).await;
+        assert!(ran);
+        assert_eq!(posted.get(Summary::Monthly), Some(date(2026, 10, 1)));
+
+        // Down over Monday 07:00: caught up at the restart.
+        let (posted, settings, _dir) = store(Some(r#"{"daily":"2026-10-11"}"#)).await;
+        let mut daily = Runner::new(Summary::Daily.job(&settings, BERLIN));
+        let (_, ran) = round(&mut daily, &posted, restart, Outcome::Done).await;
+        assert!(ran);
+        assert_eq!(posted.get(Summary::Daily), Some(date(2026, 10, 12)));
+    }
+
+    #[tokio::test]
+    async fn moving_the_weekly_day_after_the_overview_posts_on_the_new_day() {
+        // Posted Monday; moved to Wednesday: posted again then (an overlap,
+        // as before the shared schedule), not skipped for the rest of the week.
+        let (posted, settings, _dir) = store(Some(r#"{"weekly":"2026-10-12"}"#)).await;
+        settings
+            .store()
+            .set("weekly_day", "wednesday")
+            .await
+            .unwrap();
+        let mut weekly = Runner::new(Summary::Weekly.job(&settings, BERLIN));
+        let (_, ran) = round(&mut weekly, &posted, "2026-10-14T05:00:00Z", Outcome::Done).await;
+        assert!(ran);
+        assert_eq!(posted.get(Summary::Weekly), Some(date(2026, 10, 14)));
+        let (wake, ran) = round(&mut weekly, &posted, "2026-10-14T05:01:00Z", Outcome::Done).await;
+        assert!(!ran);
+        assert_eq!(wake, Some(utc("2026-10-21T05:00:00Z")));
+
+        // Moving the time within the posting day does not post it again.
+        settings.store().set("weekly_time", "09:00").await.unwrap();
+        let (_, ran) = round(&mut weekly, &posted, "2026-10-14T07:00:00Z", Outcome::Done).await;
+        assert!(!ran);
+    }
+
+    #[tokio::test]
+    async fn a_weekly_moved_to_sunday_in_the_posted_week_still_posts_on_sunday() {
+        // Monday 2026-10-26 posted the overview up to Sunday 11-01; on Tuesday
+        // the day becomes Sunday. Sunday 11-01 is in the same ISO week, and
+        // must post, or 11-02..11-07 get no overview.
+        let (posted, settings, _dir) = store(None).await;
+        let mut weekly = Runner::new(Summary::Weekly.job(&settings, BERLIN));
+        // 07:00 CET is 06:00 UTC after the autumn change.
+        let (_, ran) = round(&mut weekly, &posted, "2026-10-26T06:00:00Z", Outcome::Done).await;
+        assert!(ran);
+        settings.store().set("weekly_day", "sunday").await.unwrap();
+        // Tuesday: Sunday 10-25's run is still within the window and
+        // caught up (as before the shared schedule).
+        let (_, ran) = round(&mut weekly, &posted, "2026-10-27T10:00:00Z", Outcome::Done).await;
+        assert!(ran);
+        assert_eq!(posted.get(Summary::Weekly), Some(date(2026, 10, 25)));
+        let (wake, ran) = round(&mut weekly, &posted, "2026-10-27T10:01:00Z", Outcome::Done).await;
+        assert!(!ran);
+        assert_eq!(wake, Some(utc("2026-11-01T06:00:00Z")));
+        let (_, ran) = round(&mut weekly, &posted, "2026-11-01T06:00:00Z", Outcome::Done).await;
+        assert!(ran);
+        assert_eq!(posted.get(Summary::Weekly), Some(date(2026, 11, 1)));
+        // A new process the same Sunday posts nothing more.
+        let mut fresh = Runner::new(Summary::Weekly.job(&settings, BERLIN));
+        let (_, ran) = round(&mut fresh, &posted, "2026-11-01T08:00:00Z", Outcome::Done).await;
+        assert!(!ran);
+    }
+
+    /// A temporary directory, removed when dropped.
+    mod tempfile_dir {
+        pub struct Dir {
+            pub path: std::path::PathBuf,
+        }
+
+        impl Dir {
+            pub fn new(what: &str) -> Self {
+                let path = std::env::temp_dir().join(format!(
+                    "calendar-bot-{what}-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&path).unwrap();
+                Self { path }
+            }
+        }
+
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
     }
 }

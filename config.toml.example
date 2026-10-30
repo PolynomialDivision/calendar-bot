@@ -9,8 +9,11 @@
 # A post missed because the bot was down or restarting at the scheduled time
 # is caught up right after the start, as long as it is still useful: within
 # 12 hours for the daily, 3.5 days for the weekly and 15 days for the monthly
-# overview. When no calendar can be reached, the post is retried every
-# 15 minutes inside that window. What was handled is kept in store/posted.json.
+# overview. When no calendar can be reached, or the post reached no room
+# (the homeserver down for longer than a few minutes), it is retried every
+# 15 minutes inside that window; rooms that already have it get no second
+# copy. Times are local (TZ, else Europe/Berlin), also across the DST
+# changes. What was handled is kept in store/posted.json.
 
 # Daily summary: posted every day at the configured time.
 # enabled defaults to true, so omitting this section keeps the daily reminder on.
