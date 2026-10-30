@@ -20,6 +20,7 @@ use mxbot_common::{
     },
     persist,
     settings::Settings,
+    supervise::{supervise, supervise_ticking, Alive},
     Bot,
 };
 use serde::{Deserialize, Serialize};
@@ -826,9 +827,10 @@ async fn check_week_update(state: &BotState) {
         .await;
 }
 
-/// Check the rest of the week every [`UPDATE_CHECK`].
-async fn update_loop(state: BotState) {
+/// Check the rest of the week every [`UPDATE_CHECK`], ticking `alive` once per check.
+async fn update_loop(state: BotState, alive: Alive) {
     loop {
+        alive.tick();
         check_week_update(&state).await;
         sleep(TokioDuration::from_secs(UPDATE_CHECK.num_seconds() as u64)).await;
     }
@@ -980,10 +982,21 @@ async fn main() -> Result<()> {
     install_message_handler(&state);
 
     for kind in [Summary::Daily, Summary::Weekly, Summary::Monthly] {
-        tokio::spawn(scheduler_loop(state.clone(), kind, test_mode));
+        let task = scheduler_loop(state.clone(), kind, test_mode);
+        // Test mode posts once and ends; otherwise a loop that ends restarts the bot.
+        if test_mode {
+            tokio::spawn(task);
+        } else {
+            supervise(kind.name(), task);
+        }
     }
     if !test_mode {
-        tokio::spawn(update_loop(state.clone()));
+        // Two hours: three missed checks of UPDATE_CHECK, plus their loads.
+        supervise_ticking(
+            "week update",
+            TokioDuration::from_secs(2 * 60 * 60),
+            |alive| update_loop(state.clone(), alive),
+        );
     }
 
     info!("Starting sync...");
