@@ -755,12 +755,12 @@ fn missing_snapshot(
 /// One check: load the rest of the week (and the weeks after it, to tell
 /// moved from cancelled), compare it with the last overview and post the
 /// rest of the week again when something changed.
-async fn check_week_update(state: &BotState) {
+async fn check_week_update(state: &BotState) -> Check {
     let now = state.zone.now().naive_local();
     let Some(before) = state.week.get() else {
         let posted = state.posted.get(Summary::Weekly);
         let Some(run) = missing_snapshot(now, &state.schedule.get(), posted) else {
-            return;
+            return Check::Idle;
         };
         let until = run.date() + Duration::days(6);
         let loaded = load(state, now.date(), (until - now.date()).num_days() + 1).await;
@@ -768,12 +768,13 @@ async fn check_week_update(state: &BotState) {
             info!("Week update: no snapshot of this week's overview, taking the calendar as it is now");
             let week = update::WeekSnapshot::of(&loaded.days, until, run, true);
             state.week.set(week).await;
+            return Check::Done;
         }
-        return;
+        return Check::load_failed(&loaded);
     };
     if let Some(why) = update_wait(now, &state.schedule.get(), Some(&before)) {
         info!("Week update: not now ({why})");
-        return;
+        return Check::Idle;
     }
     let today = now.date();
     let loaded = load(state, today, NEXT_LOOKAHEAD_DAYS).await;
@@ -783,7 +784,7 @@ async fn check_week_update(state: &BotState) {
             "Week update skipped: {} of {} calendar(s) failed",
             loaded.failed, loaded.total
         );
-        return;
+        return Check::load_failed(&loaded);
     }
     let in_week = ((before.until - today).num_days() + 1) as usize;
     let (week, later) = loaded.days.split_at(in_week.min(loaded.days.len()));
@@ -798,12 +799,12 @@ async fn check_week_update(state: &BotState) {
                 true,
             ))
             .await;
-        return;
+        return Check::Done;
     }
     let found = update::changes(&before, week, later, now);
     if found.is_empty() {
         info!("Week update: no changes");
-        return;
+        return Check::Idle;
     }
     info!(
         "Posting week update ({} changed, {} gone)",
@@ -836,19 +837,52 @@ async fn check_week_update(state: &BotState) {
         .await;
     if let Outcome::RetryIn(_) = delivered.outcome(RETRY_AFTER) {
         warn!("Week update not delivered everywhere, trying again at the next check");
-        return;
+        return Check::Failed("week update not delivered everywhere".to_owned());
     }
     state
         .week
         .set(update::WeekSnapshot::of(week, before.until, now, true))
         .await;
+    Check::Done
 }
 
-/// Check the rest of the week every [`UPDATE_CHECK`], ticking `alive` once per check.
+/// How a check of the week went, for the status file (the check's behaviour does not
+/// depend on it).
+#[derive(Debug, PartialEq, Eq)]
+enum Check {
+    /// Did something: took a snapshot, or posted an update.
+    Done,
+    /// Nothing to do: no snapshot needed, quiet hours, no changes.
+    Idle,
+    /// A calendar could not be loaded, or the update not delivered.
+    Failed(String),
+}
+
+impl Check {
+    fn load_failed(loaded: &Loaded) -> Self {
+        Check::Failed(format!(
+            "{} of {} calendar(s) failed to load",
+            loaded.failed, loaded.total
+        ))
+    }
+
+    fn report(self, alive: &Alive) {
+        match self {
+            Check::Done => alive.ok(),
+            Check::Idle => alive.idle(),
+            Check::Failed(reason) => alive.failed(reason),
+        }
+    }
+}
+
+/// Check the rest of the week every [`UPDATE_CHECK`], reporting each check to `alive`.
 async fn update_loop(state: BotState, alive: Alive) {
+    alive.expect_every(std::time::Duration::from_secs(
+        UPDATE_CHECK.num_seconds() as u64
+    ));
     loop {
         alive.tick();
-        check_week_update(&state).await;
+        check_week_update(&state).await.report(&alive);
         sleep(TokioDuration::from_secs(UPDATE_CHECK.num_seconds() as u64)).await;
     }
 }
@@ -1069,6 +1103,32 @@ fn install_message_handler(state: &BotState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn week_checks_are_reported_for_the_status_file() {
+        use mxbot_common::supervise::{report, snapshot};
+        let alive = report("week update under test");
+        let loaded = Loaded {
+            days: Vec::new(),
+            failed: 1,
+            total: 3,
+        };
+        Check::Done.report(&alive);
+        Check::Idle.report(&alive);
+        Check::load_failed(&loaded).report(&alive);
+        let task = snapshot()
+            .into_iter()
+            .find(|t| t.name == "week update under test")
+            .unwrap();
+        assert_eq!(
+            (task.ok_total, task.idle_total, task.failed_total),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            task.last_err_reason.as_deref(),
+            Some("1 of 3 calendar(s) failed to load")
+        );
+    }
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
