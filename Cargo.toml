@@ -1,0 +1,26 @@
+[package]
+name = "calendar-bot"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "calendar-bot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+chrono-tz = "0.10.4"
+mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common", features = ["calendar", "schedule"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+[dev-dependencies]
+toml = "0.8"
+
+# A panic anywhere ends the bot and Docker restarts it, as a supervised task
+# that ends does (mxbot_common::supervise).
+[profile.release]
+panic = "abort"
