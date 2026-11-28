@@ -81,10 +81,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2cb931c189b85683d69a5cfad41d4d418671e1ac413dd209f3f2fc31e3cfd902"
 
 [[package]]
-name = "anymap2"
-version = "0.13.0"
+name = "anymap3"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
+checksum = "fb5dfbc6d8d2675589ccbe4d0fd61df2419075625f8c1a62325e718e2b0049f9"
 
 [[package]]
 name = "archery"
@@ -660,9 +660,9 @@ dependencies = [
 
 [[package]]
 name = "decancer"
-version = "3.3.3"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9244323129647178bf41ac861a2cdb9d9c81b9b09d3d0d1de9cd302b33b8a1d"
+checksum = "453589e364ce786381e7bcbf0d659088ff7e4d3e77f948dd1cf861344acf7a86"
 
 [[package]]
 name = "delegate-display"
@@ -1859,17 +1859,16 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk"
-version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
+version = "0.20.0"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=cleartext-mentions-0.20.0#f467efa7eca8e8e0a48b9eb8a2a870b7ad348aa0"
 dependencies = [
- "anymap2",
+ "anymap3",
  "as_variant",
  "async-stream",
  "async-trait",
  "backon",
  "bytes",
  "bytesize",
- "cfg-if",
  "event-listener",
  "eyeball",
  "eyeball-im",
@@ -1912,8 +1911,8 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-base"
-version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
+version = "0.20.0"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=cleartext-mentions-0.20.0#f467efa7eca8e8e0a48b9eb8a2a870b7ad348aa0"
 dependencies = [
  "as_variant",
  "async-trait",
@@ -1933,14 +1932,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tracing",
  "unicode-normalization",
 ]
 
 [[package]]
 name = "matrix-sdk-common"
-version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
+version = "0.20.0"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=cleartext-mentions-0.20.0#f467efa7eca8e8e0a48b9eb8a2a870b7ad348aa0"
 dependencies = [
  "eyeball-im",
  "futures-core",
@@ -1962,15 +1962,14 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-crypto"
-version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
+version = "0.20.0"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=cleartext-mentions-0.20.0#f467efa7eca8e8e0a48b9eb8a2a870b7ad348aa0"
 dependencies = [
  "aes",
  "as_variant",
  "async-trait",
  "bs58",
  "byteorder",
- "cfg-if",
  "ctr",
  "eyeball",
  "futures-core",
@@ -2001,8 +2000,8 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-indexeddb"
-version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
+version = "0.20.0"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=cleartext-mentions-0.20.0#f467efa7eca8e8e0a48b9eb8a2a870b7ad348aa0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2033,8 +2032,8 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-sqlite"
-version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
+version = "0.20.0"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=cleartext-mentions-0.20.0#f467efa7eca8e8e0a48b9eb8a2a870b7ad348aa0"
 dependencies = [
  "as_variant",
  "async-trait",
@@ -2061,8 +2060,8 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-store-encryption"
-version = "0.19.1"
-source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=msc3952-mentions-encrypted-0.19#1c658d5557893432cd038e6c563b2149e687cfb1"
+version = "0.20.0"
+source = "git+https://github.com/PolynomialDivision/matrix-rust-sdk?branch=cleartext-mentions-0.20.0#f467efa7eca8e8e0a48b9eb8a2a870b7ad348aa0"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -2162,7 +2161,7 @@ dependencies = [
 [[package]]
 name = "mxbot-common"
 version = "0.2.0"
-source = "git+https://github.com/PolynomialDivision/mxbot-common#33ee01f9f88451102860b68888b044e9572dafa2"
+source = "git+https://github.com/PolynomialDivision/mxbot-common#fe1a3e742b1b4b47dfbb4dac8db7647d5b2d49c4"
 dependencies = [
  "anyhow",
  "calcard",
@@ -2752,9 +2751,9 @@ dependencies = [
 
 [[package]]
 name = "ruma"
-version = "0.17.2"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5883cf806b796aba27c7157a438a10df8904bb70511c2fac872c59a7823915f9"
+checksum = "7b23460f628d871a98817fb3464137a0ca4fe3ca0eb4c208af763e8197ceb46b"
 dependencies = [
  "assign",
  "js_int",
@@ -2769,9 +2768,9 @@ dependencies = [
 
 [[package]]
 name = "ruma-client-api"
-version = "0.25.2"
+version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "506e521d721c5cbd2c590d50d46c60cd3d32e38c00fbb0173da9a27d9a532172"
+checksum = "2b5683c0721fbb60a312a3800750a5fcd771989ae114a1c7db9057d5aa5520b0"
 dependencies = [
  "as_variant",
  "assign",
@@ -2792,9 +2791,9 @@ dependencies = [
 
 [[package]]
 name = "ruma-common"
-version = "0.20.2"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b496f80bc1cca375294fba5170bfb5d00f0de0ed655675dc72fa782643f54ea"
+checksum = "74abf470717970204715ca459e6262bfa2914661742a1b76666d393c302a67b7"
 dependencies = [
  "as_variant",
  "base64 0.23.1",
@@ -2826,9 +2825,9 @@ dependencies = [
 
 [[package]]
 name = "ruma-events"
-version = "0.35.2"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28eb4aebc89f505550aad7dacaf86276d8041992836ff53e4cebfcb0165beec5"
+checksum = "1d67250468a5e7395ec8f24ab0f7e582ac1c7405272a6c0bbdc387f7172684e9"
 dependencies = [
  "as_variant",
  "indexmap",
@@ -2847,9 +2846,9 @@ dependencies = [
 
 [[package]]
 name = "ruma-federation-api"
-version = "0.16.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc4279fed55a246c3382ca3289bc9081eec97ff6c047365f0a627e02655419bf"
+checksum = "e9d8d98d10fdecbfc006d67c38b1e5f7c4568f6ffb151298227543353532a459"
 dependencies = [
  "http",
  "http-auth",
@@ -2866,9 +2865,9 @@ dependencies = [
 
 [[package]]
 name = "ruma-html"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e27e35e6c36fa1abc4def766e474a0f2f709e87f1602d57ec34d41b09253da4"
+checksum = "7f430da060178156ce1ef19cb77d7144a3d120455607696343fa24449a2f3d7b"
 dependencies = [
  "as_variant",
  "html5ever",
@@ -2888,9 +2887,9 @@ dependencies = [
 
 [[package]]
 name = "ruma-macros"
-version = "0.20.2"
+version = "0.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0f3214335d3957e7e677d0425949ec6900b74d5b7b5b3736a8a7a9ab0fd11ef"
+checksum = "a4625d3bef3388bc04377ba9fa2fcb81d12ddc001047b5f2f52be7aa58651e15"
 dependencies = [
  "as_variant",
  "cfg-if",
@@ -2905,9 +2904,9 @@ dependencies = [
 
 [[package]]
 name = "ruma-signatures"
-version = "0.22.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "800646996bcb7e57cd81602efcb6d46918bc6770d8fca15c7820c760f514c1b0"
+checksum = "dbacddc59e931d0349bdee7de3d4eb26135b83461b03e21df27994d6f421682c"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
